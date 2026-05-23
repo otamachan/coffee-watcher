@@ -66,6 +66,28 @@ static float    g_cached_cups       = 0.0f;
 static float    g_cached_confidence = 0.0f;
 static String   g_cached_reason;
 
+// 最近のイベントログ (リングバッファ、シリアルに繋がなくてもダッシュボードで見れる)。
+struct LogEntry {
+  time_t epoch = 0;
+  String tag;       // BOOT / WIFI / NTP / TEAMS / GEMINI / CHECK / EVENT
+  String message;
+  bool   error = false;
+};
+static constexpr int kLogSize = 16;
+static LogEntry g_log[kLogSize];
+static int      g_log_next = 0;   // 次に書き込むインデックス
+static int      g_log_count = 0;  // 累計 (上限なし、表示は最新 kLogSize 件)
+
+static void logEvent(const char* tag, const String& msg, bool is_error = false) {
+  g_log[g_log_next].epoch   = time(nullptr);
+  g_log[g_log_next].tag     = tag;
+  g_log[g_log_next].message = msg;
+  g_log[g_log_next].error   = is_error;
+  g_log_next = (g_log_next + 1) % kLogSize;
+  ++g_log_count;
+  Serial.printf("[%s%s] %s\n", is_error ? "ERR " : "", tag, msg.c_str());
+}
+
 static void blinkFast(int times) {
   for (int i = 0; i < times; ++i) {
     digitalWrite(kLedPin, LOW);
@@ -73,6 +95,18 @@ static void blinkFast(int times) {
     digitalWrite(kLedPin, HIGH);
     delay(80);
   }
+}
+
+// フェーズ完了の合図: 短い点滅 N 回 + 待ち。
+// 1=Camera, 2=Wi-Fi, 3=NTP, 4=HTTP, 5=Boot 通知完了 (起動シーケンス完了)。
+static void blinkAck(int times) {
+  for (int i = 0; i < times; ++i) {
+    digitalWrite(kLedPin, LOW);
+    delay(70);
+    digitalWrite(kLedPin, HIGH);
+    delay(120);
+  }
+  delay(400);  // 次のフェーズと視覚的に区別するための間
 }
 
 static bool connectWifi(uint32_t timeout_ms = 20000) {
@@ -87,9 +121,14 @@ static bool connectWifi(uint32_t timeout_ms = 20000) {
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - t0 > timeout_ms) {
       Serial.printf("\n[wifi] connect TIMEOUT (status=%d)\n", WiFi.status());
+      digitalWrite(kLedPin, HIGH);  // 消灯して終了
       return false;
     }
-    delay(250);
+    // 接続中は速い点滅 (50ms ON / 200ms OFF) で「探索中」を視覚化
+    digitalWrite(kLedPin, LOW);
+    delay(50);
+    digitalWrite(kLedPin, HIGH);
+    delay(200);
     Serial.print(".");
   }
   Serial.println();
@@ -136,8 +175,8 @@ static bool cameraInit() {
   cfg.pin_reset    = RESET_GPIO_NUM;
   cfg.xclk_freq_hz = 20000000;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;       // 640x480
-  cfg.jpeg_quality = 15;  // 28KB payload 制限の余裕用に q=10→15 で少し小さく
+  cfg.frame_size   = FRAMESIZE_CIF;       // 352x288 (Teams payload を小さく保つ)
+  cfg.jpeg_quality = 15;
   cfg.fb_count     = 2;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
   cfg.grab_mode    = CAMERA_GRAB_LATEST;
@@ -317,6 +356,11 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
   if (code != 200) {
     r.error = "HTTP " + String(code);
     Serial.printf("[gemini] err: %s\n", resp.substring(0, 500).c_str());
+    // 短い要約だけログ化 (429 の "Please retry in X" 部分など)
+    String snippet = resp;
+    snippet.replace("\n", " ");
+    if (snippet.length() > 120) snippet = snippet.substring(0, 117) + "...";
+    logEvent("GEMINI", String("HTTP ") + code + " " + snippet, true);
     return r;
   }
 
@@ -348,6 +392,12 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
   r.ok = true;
   Serial.printf("[gemini] cups=%.2f state=%s conf=%.2f reason=%s\n",
                 r.cups_remaining, r.state.c_str(), r.confidence, r.reason.c_str());
+  {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "state=%s cups=%.1f conf=%.2f",
+             r.state.c_str(), r.cups_remaining, r.confidence);
+    logEvent("GEMINI", msg, false);
+  }
   cacheLatest(jpeg, jpeg_len, r);
   return r;
 }
@@ -438,6 +488,16 @@ static bool teamsPost(const char* title, const char* text,
   if (!delivered && code >= 200 && code < 300) {
     Serial.println("[teams] HTTP 2xx but body != '1' -> delivery FAILED on Teams side");
   }
+
+  if (delivered) {
+    logEvent("TEAMS", String("posted (\"") + title + "\")", false);
+  } else {
+    String snippet = trimmed;
+    if (snippet.length() > 120) snippet = snippet.substring(0, 117) + "...";
+    char msg[200];
+    snprintf(msg, sizeof(msg), "HTTP %d body=%s", code, snippet.c_str());
+    logEvent("TEAMS", msg, true);
+  }
   return delivered;
 }
 
@@ -522,9 +582,9 @@ static void runCheck(bool force = false) {
       g_brew_epoch  = now_t;
       g_status_sent = false;
       posted = true;
-      Serial.printf("[check] BREWED posted (brew_t=%ld)\n", static_cast<long>(now_t));
+      logEvent("EVENT", "BREWED posted", false);
     } else {
-      Serial.println("[check] BREWED post FAILED; will retry next cycle");
+      logEvent("EVENT", "BREWED post failed; will retry next cycle", true);
     }
   } else if (!was_empty && now_empty) {
     // (3) 空検知: 非空 → 空
@@ -532,9 +592,9 @@ static void runCheck(bool force = false) {
     if (teamsPost("☕ コーヒーがなくなりました！", text.c_str(), jpeg, jpeg_len)) {
       g_status_sent = true;   // 念のため (status 重複防止)
       posted = true;
-      Serial.println("[check] EMPTIED posted");
+      logEvent("EVENT", "EMPTIED posted", false);
     } else {
-      Serial.println("[check] EMPTIED post FAILED; will retry next cycle");
+      logEvent("EVENT", "EMPTIED post failed; will retry next cycle", true);
     }
   } else if (g_brew_epoch > 0 && !g_status_sent &&
              !now_empty && now_t >= g_brew_epoch + kStatusDelaySec) {
@@ -543,9 +603,9 @@ static void runCheck(bool force = false) {
     if (teamsPost("☕ コーヒー残量更新", text.c_str(), jpeg, jpeg_len)) {
       g_status_sent = true;
       posted = true;
-      Serial.println("[check] STATUS posted");
+      logEvent("EVENT", "STATUS posted", false);
     } else {
-      Serial.println("[check] STATUS post FAILED; will retry next cycle");
+      logEvent("EVENT", "STATUS post failed; will retry next cycle", true);
     }
   } else {
     Serial.println("[check] no event");
@@ -600,16 +660,23 @@ void setup() {
     delay(3000);
     ESP.restart();
   }
+  blinkAck(1);  // Camera OK
 
   if (!connectWifi()) {
     blinkFast(20);
-    Serial.println("[fatal] wifi failed; restart in 3s");
+    logEvent("WIFI", "connect failed; restart in 3s", true);
     delay(3000);
     ESP.restart();
   }
+  logEvent("WIFI", String("connected IP=") + WiFi.localIP().toString() +
+                   " RSSI=" + WiFi.RSSI() + " dBm", false);
+  blinkAck(2);  // Wi-Fi OK
 
   if (!syncNtp()) {
-    Serial.println("[ntp] continuing; TLS calls will fail until time syncs");
+    logEvent("NTP", "sync timeout; TLS calls will fail until time syncs", true);
+  } else {
+    logEvent("NTP", "synced", false);
+    blinkAck(3);  // NTP OK
   }
 
   server.on("/", HTTP_GET, []() {
@@ -636,6 +703,12 @@ void setup() {
       ".actions a{flex:1;text-align:center;padding:.7em 1em;background:#0078D4;color:#fff;"
       "text-decoration:none;border-radius:4px;min-width:8em}"
       ".actions a.warn{background:#a04020}"
+      ".log{font-family:monospace;font-size:.85em;border-collapse:collapse;width:100%}"
+      ".log td{padding:.2em .4em;vertical-align:top;border-bottom:1px solid #eee}"
+      ".log td.t{color:#888;white-space:nowrap;width:7em}"
+      ".log td.g{color:#555;white-space:nowrap;width:5em;font-weight:bold}"
+      ".log tr.err td.g{color:#a02020}"
+      ".log tr.err td.m{color:#a02020}"
       "</style></head><body>"
       "<h1>☕ Coffee Watcher</h1>");
 
@@ -677,8 +750,38 @@ void setup() {
       "<div class=\"actions\">"
       "<a href=\"/analyze?ui=1\">推論を更新</a>"
       "<a class=\"warn\" href=\"/now?ui=1\">推論を更新 + Teams 投稿</a>"
-      "</div>"
-      "</body></html>");
+      "</div>");
+
+    // 最近のイベントログ (新しい順)。
+    html += F("<h2>最近のイベント</h2>");
+    if (g_log_count == 0) {
+      html += F("<p class=\"nodata\">まだイベントなし</p>");
+    } else {
+      html += F("<table class=\"log\">");
+      // ring buffer の最新→過去の順で走査
+      const int n = (g_log_count < kLogSize) ? g_log_count : kLogSize;
+      for (int i = 0; i < n; ++i) {
+        const int idx = (g_log_next - 1 - i + kLogSize) % kLogSize;
+        const LogEntry& e = g_log[idx];
+        char ts[16] = "--:--:--";
+        struct tm tm{};
+        // 2020-01-01 = 1577836800 以前は NTP 未同期とみなす
+        if (e.epoch > 1577836800 && localtime_r(&e.epoch, &tm)) {
+          strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+        }
+        html += e.error ? F("<tr class=\"err\">") : F("<tr>");
+        html += F("<td class=\"t\">");
+        html += ts;
+        html += F("</td><td class=\"g\">");
+        html += htmlEscape(e.tag);
+        html += F("</td><td class=\"m\">");
+        html += htmlEscape(e.message);
+        html += F("</td></tr>");
+      }
+      html += F("</table>");
+    }
+
+    html += F("</body></html>");
 
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", html);
@@ -831,6 +934,8 @@ void setup() {
   });
   server.begin();
   Serial.printf("[http] http://%s/\n", WiFi.localIP().toString().c_str());
+  logEvent("HTTP", String("server up at http://") + WiFi.localIP().toString() + "/", false);
+  blinkAck(4);  // HTTP server up — 以後はブラウザでログ閲覧可
 
   // 起動通知 (現在のカメラ画像 + IP / RSSI)。
   // 致命的な初期化失敗時はここに到達しないので、起動成功の証跡を兼ねる。
@@ -854,7 +959,9 @@ void setup() {
       const bool ok = teamsPost("🟢 cam-watcher 起動",
                                 body.c_str(), jpeg, jpeg_len);
       Serial.printf("[boot] notification %s\n", ok ? "posted" : "FAILED");
+      logEvent("BOOT", ok ? "notification posted" : "notification FAILED", !ok);
       free(jpeg);
+      blinkAck(5);  // 起動シーケンス完了 (Boot 通知の成否は問わず)
     } else {
       esp_camera_fb_return(fb);
       Serial.println("[boot] notification: ps_malloc failed");
