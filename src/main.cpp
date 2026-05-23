@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -65,6 +66,29 @@ static String   g_cached_state;
 static float    g_cached_cups       = 0.0f;
 static float    g_cached_confidence = 0.0f;
 static String   g_cached_reason;
+
+// Teams 投稿先チャネル ("test" or "prod")。NVS に永続化。
+static Preferences prefsCfg;
+static String g_channel = "test";
+
+static const char* teamsUrl() {
+  return (g_channel == "prod") ? TEAMS_WEBHOOK_URL_PROD : TEAMS_WEBHOOK_URL_TEST;
+}
+
+static void loadChannel() {
+  prefsCfg.begin("cw-cfg", true);
+  g_channel = prefsCfg.getString("channel", "test");
+  prefsCfg.end();
+  if (g_channel != "test" && g_channel != "prod") g_channel = "test";
+}
+
+static void saveChannel(const String& ch) {
+  if (ch != "test" && ch != "prod") return;
+  g_channel = ch;
+  prefsCfg.begin("cw-cfg", false);
+  prefsCfg.putString("channel", ch);
+  prefsCfg.end();
+}
 
 // 最近のイベントログ (リングバッファ、シリアルに繋がなくてもダッシュボードで見れる)。
 struct LogEntry {
@@ -456,7 +480,7 @@ static bool teamsPost(const char* title, const char* text,
 
   HTTPClient http;
   http.setTimeout(15000);
-  if (!http.begin(client, TEAMS_WEBHOOK_URL)) {
+  if (!http.begin(client, teamsUrl())) {
     Serial.println("[teams] http.begin failed");
     free(payload);
     return false;
@@ -490,7 +514,7 @@ static bool teamsPost(const char* title, const char* text,
   }
 
   if (delivered) {
-    logEvent("TEAMS", String("posted (\"") + title + "\")", false);
+    logEvent("TEAMS", String("posted to ") + g_channel + " (\"" + title + "\")", false);
   } else {
     String snippet = trimmed;
     if (snippet.length() > 120) snippet = snippet.substring(0, 117) + "...";
@@ -747,6 +771,9 @@ void setup() {
     blinkAck(3);  // NTP OK
   }
 
+  loadChannel();
+  logEvent("CONFIG", String("channel=") + g_channel, false);
+
   server.on("/", HTTP_GET, []() {
     String html;
     html.reserve(3072);
@@ -819,6 +846,18 @@ void setup() {
       "<a href=\"/analyze?ui=1\">推論を更新</a>"
       "<a class=\"warn\" href=\"/now?ui=1\">推論を更新 + Teams 投稿</a>"
       "</div>");
+
+    // 投稿先チャネル
+    html += F("<h2>Teams 投稿先</h2>");
+    html += F("<p>現在: <b>");
+    html += htmlEscape(g_channel);
+    html += F("</b></p><div class=\"actions\">");
+    if (g_channel == "test") {
+      html += F("<a class=\"warn\" href=\"/channel?to=prod&ui=1\">本番チャネルに切替</a>");
+    } else {
+      html += F("<a href=\"/channel?to=test&ui=1\">テストチャネルに戻す</a>");
+    }
+    html += F("</div>");
 
     // 最近のイベントログ (新しい順)。
     html += F("<h2>最近のイベント</h2>");
@@ -955,6 +994,31 @@ void setup() {
     g_status_sent = false;
     server.send(200, "text/plain", "state cleared (RAM only)\n");
   });
+  server.on("/channel", HTTP_GET, []() {
+    if (server.hasArg("to")) {
+      const String to = server.arg("to");
+      if (to != "test" && to != "prod") {
+        server.send(400, "text/plain", "to must be 'test' or 'prod'\n");
+        return;
+      }
+      const String prev = g_channel;
+      saveChannel(to);
+      logEvent("CONFIG", String("channel ") + prev + " -> " + to, false);
+      if (server.hasArg("ui")) {
+        server.sendHeader("Location", "/");
+        server.send(303, "text/plain", "switched\n");
+        return;
+      }
+    }
+    JsonDocument out;
+    out["channel"] = g_channel;
+    out["url"]     = teamsUrl();
+    String body;
+    serializeJsonPretty(out, body);
+    body += "\n";
+    server.send(200, "application/json", body);
+  });
+
   server.on("/jpg", HTTP_GET, handleJpg);
   // デバッグ用: 現在の生 JPEG を縮小して返す (Teams に投げてる版と同じ)
   server.on("/thumb.jpg", HTTP_GET, []() {
