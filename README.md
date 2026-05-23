@@ -1,26 +1,27 @@
-# cam-watcher
+# Coffee Watcher
 
-ESP32-CAM 単体で動くコーヒーメーカーのコーヒー残量ウォッチャー。
-定期的にカラフェを撮影 → Claude Vision で残量推定 → 変化があれば Microsoft Teams に通知。
+ESP32-CAM 単体で動くコーヒーメーカーの残量ウォッチャー。
+定期的にコーヒーサーバーを撮影 → Google Gemini Vision で残量推定 → 状態変化があれば Microsoft Teams に通知。
 
 ```
 [ESP32-CAM]
    |  1) NTP 同期 (TLS 証明書検証に必須)
    |  2) インターバル毎にカメラキャプチャ (VGA JPEG, PSRAM)
-   |  3) base64 化 → Anthropic Messages API へ HTTPS POST
-   |     (tool_use で {cups_remaining, state, confidence, reason} を構造化出力)
-   |  4) 前回値 (NVS) と比較
-   |  5) 変化が閾値を超えたら Teams Webhook へ POST
-   |  6) NVS に最新値を保存
+   |  3) base64 化 → Gemini API (generateContent) へ HTTPS POST
+   |     (responseSchema で {cups_remaining, state, confidence, reason})
+   |  4) 前回観測 (RAM 保持) と比較しイベントを判定
+   |  5) BREWED / STATUS / EMPTIED のいずれかに該当すれば
+   |     Teams Incoming Webhook へ MessageCard で投稿
    v
 [loop]
 ```
 
 ## なぜ ESP32 単体か
 
-- 常時稼働の PC・SBC を置きたくない
-- クラウド関数も挟まず、デバイス 1 個で完結させる
-- 代償: プロンプト/閾値の調整に再書き込み (or LittleFS 経由の動的更新機構) が要る
+- 常時稼働の PC や SBC を置きたくない
+- クラウド関数も挟まず、デバイス 1 個で完結
+- 状態は **RAM のみ**で保持 (再起動時はリセット、再起動は稀という割り切り)
+- 代償: プロンプト/閾値の調整に再書き込みが要る (将来 LittleFS で動的化したい)
 
 ## ハードウェア (確認済み)
 
@@ -42,6 +43,15 @@ ESP32-CAM 単体で動くコーヒーメーカーのコーヒー残量ウォッ�
 | SIOC (SCL) | 27 |
 | Y2-Y9 | 4, 5, 18, 19, 36, 39, 34, 35 |
 | VSYNC / HREF / PCLK | 25 / 23 / 22 |
+
+## 外部サービス
+
+- **Google Gemini API** (`gemini-flash-lite-latest`) — vision 推論、無料枠で運用
+  - 認証: `x-goog-api-key` ヘッダ
+  - TLS root: GTS Root R1
+- **Microsoft Teams Incoming Webhook** — Adaptive Card / MessageCard 投稿
+  - TLS root: DigiCert Global Root G2
+  - 配信成功判定: body == `"1"` (HTTP 200 は配信失敗時も返る)
 
 ## 開発環境
 
@@ -72,7 +82,14 @@ ESP32-CAM 単体で動くコーヒーメーカーのコーヒー残量ウォッ�
 
    反映には再ログインが必要。即時に試したい場合は一時的に `sudo chmod a+rw /dev/ttyUSB0`。
 
-3. 接続確認
+3. `secrets.h` を作成 (Git 管理外)
+
+   ```bash
+   cp src/secrets.h.example src/secrets.h
+   # 編集して Wi-Fi / GEMINI_API_KEY / TEAMS_WEBHOOK_URL を埋める
+   ```
+
+4. 接続確認
 
    ```bash
    pio device list
@@ -90,65 +107,91 @@ pio run -t clean        # 中間物クリア
 
 Freenove ESP32 WROVER は USB-C 経由で自動リセット・自動書き込みモードに入る。手動の boot/reset 操作は不要。
 
-## 現状の `src/main.cpp`
+## 実行時の動作
 
-起動時にチップ情報・PSRAM 量を出力し、カメラ初期化 → Wi-Fi 接続 → NTP 同期。
-平日 9:00-18:00 JST のみ 5 分ごとに「撮影 → Gemini で残量推定 → 前回比較 → 状態変化があれば Teams 投稿」。
+起動シーケンス: チップ情報出力 → カメラ初期化 → Wi-Fi 接続 → NTP 同期 → 起動通知を Teams へ投稿。
 
-### HTTP エンドポイント (ESP32)
+その後 **平日 9:00-18:00 JST** のみ、**5 分間隔**で以下を繰り返す:
 
-| パス | 動作 |
-|---|---|
-| `GET /` , `/jpg` | 現在の JPEG を返す |
-| `GET /analyze` | Gemini に投げて構造化結果を JSON で返す (Teams 投稿はしない) |
-| `GET /post` | 現在の JPEG を Teams にテスト投稿 (LLM 介さず固定文言) |
-| `GET /check` | 通常のパイプライン1サイクルを強制実行 (アクティブ時間外でも動く) |
-| `GET /state` | 現在の NVS 状態を JSON で返す |
-| `GET /reset-state` | NVS をクリア |
+1. JPEG キャプチャ
+2. Gemini に投げて構造化出力 (cups_remaining / state / confidence / reason) を取得
+3. confidence < 0.5 はスキップ
+4. 直前観測と比較しイベント判定
+5. 該当イベントがあれば Teams 投稿
 
 ### イベント
 
-| イベント | 条件 | メッセージ |
+| イベント | 条件 | Teams 投稿タイトル |
 |---|---|---|
-| BREWED | 空→非空 | ☕ 新しくコーヒーがはいりました！ |
-| STATUS | BREWED から 30 分経過 | ☕ コーヒー残量更新 (残り約N杯です) |
-| EMPTIED | 非空→空 | ☕ コーヒーがなくなりました！ |
+| BREWED | 空 → 非空 | ☕ 新しくコーヒーがはいりました！ |
+| STATUS | BREWED から 30 分経過 (1 ブリューにつき 1 回) | ☕ コーヒー残量更新 |
+| EMPTIED | 非空 → 空 | ☕ コーヒーがなくなりました！ |
+
+### HTTP エンドポイント
+
+ブラウザは `http://<ESP32-IP>/` を開けば OK。
+
+| パス | 用途 |
+|---|---|
+| `GET /` | **ダッシュボード**: ライブ画像 + 最後の推論結果 + 操作ボタン (60s 自動リロード) |
+| `GET /jpg` | 撮りたて JPEG を返す (推論なし) |
+| `GET /last.jpg` | 最後に推論したときの JPEG (キャッシュ) |
+| `GET /analyze[?ui=1]` | 撮影 + Gemini 推論 (Teams 投稿なし)。`ui=1` で `/` にリダイレクト |
+| `GET /now[?ui=1]` | 撮影 + Gemini 推論 + Teams 投稿。同上 |
+| `GET /check` | 自動ループと同じ処理を 1 回強制実行 (デバッグ用) |
+| `GET /state` | 現在の RAM 状態を JSON で返す |
+| `GET /reset-state` | RAM 状態をクリア |
+| `GET /post` | 固定文言を Teams にテスト投稿 (Gemini を介さない) |
+
+## プロンプト
+
+`src/main.cpp` 内の `kPrompt` に日本語で記述。`responseSchema` でフィールドを固定:
+
+```
+ドリップ式コーヒーメーカーのコーヒーサーバー (ガラス製ポット) の画像です。
+コーヒーの残量を推定して、スキーマに沿った JSON で返してください。
+- cups_remaining: 杯数の推定値 (0.0=空、最大10.0、小数可)
+- state: empty / partial / full
+- confidence: 0.0〜1.0 (サーバーが写っていない場合は 0.3 未満)
+- reason: 日本語で 1 文の理由
+```
 
 ## プロジェクト構成
 
 ```
-cam-watcher/
-├── platformio.ini   # ボード=esp32cam, PSRAM 有効化, ttyUSB0 設定
-├── src/main.cpp     # 現状は診断スケッチ
-├── include/         # ヘッダ (未使用)
-├── lib/             # プロジェクトローカルライブラリ (未使用)
-├── test/            # PlatformIO unit test (未使用)
+coffee-watcher/
+├── platformio.ini      # board=esp32cam, PSRAM 有効化, ttyUSB0
+├── src/
+│   ├── main.cpp        # 本体 (キャプチャ / Gemini / Teams / HTTP / ループ)
+│   ├── cert.h          # GTS Root R1 (Gemini) と DigiCert G2 (Teams)
+│   ├── secrets.h       # 機密値 (Git 除外)
+│   └── secrets.h.example
 └── README.md
 ```
 
+## secrets.h に必要な値
+
+| 名前 | 用途 |
+|---|---|
+| `WIFI_SSID`, `WIFI_PASSWORD` | Wi-Fi 接続 |
+| `GEMINI_API_KEY` | Google AI Studio で発行 (`AIza...`) |
+| `TEAMS_WEBHOOK_URL` | Teams チャネルの Incoming Webhook URL |
+
 ## ロードマップ
 
-- [x] 開発環境構築 (PlatformIO + プロジェクト初期化)
-- [x] 診断スケッチでビルド通過
-- [x] 実機書き込みでチップ情報・PSRAM 量を確認 (ESP32-D0WD-V3, PSRAM 4MB)
-- [x] Wi-Fi 接続 + NTP 同期 (JST, ntp.nict.jp/pool.ntp.org)
-- [x] カメラ初期化と JPEG キャプチャ (OV3660, VGA ~9KB/frame)
-- [x] Teams Webhook へ画像付き投稿 (MessageCard + data URI base64)
-- [x] Gemini API 疎通 (GTS Root R1, gemini-2.5-flash)
-- [x] Gemini Vision で残量推定 (responseSchema で構造化出力)
-- [x] パイプライン統合 + 3 イベント検知 (BREWED / STATUS / EMPTIED, 状態は RAM のみ)
+- [x] 開発環境構築 (PlatformIO)
+- [x] Wi-Fi + NTP
+- [x] カメラ初期化 (OV3660, VGA JPEG)
+- [x] Teams Webhook へ画像付き投稿 (data URI base64)
+- [x] Gemini API 疎通 + 残量推定 (構造化出力)
+- [x] パイプライン統合 + 3 イベント検知 (BREWED / STATUS / EMPTIED)
 - [x] アクティブ時間制限 (平日 9:00-18:00 JST)
-- [ ] LittleFS でプロンプト・閾値を動的更新
+- [x] HTTP ダッシュボード
+- [ ] LittleFS でプロンプト / 閾値を再書き込みなしで更新
 - [ ] Wi-Fi 再接続 / 指数バックオフ / WDT / heap 監視
 
-## 設定すべき値 (実装時に必要)
+## 注意点
 
-| 項目 | 用途 |
-|---|---|
-| Wi-Fi SSID / パスワード | Wi-Fi 接続 |
-| `ANTHROPIC_API_KEY` | Claude Messages API |
-| Teams Webhook URL | 投稿先 (Incoming Webhook or Power Automate URL) |
-| 満タン杯数 | プロンプトで残量レンジの上限に使う |
-| ポーリング間隔 | 推奨 5〜15 分。コストと検知頻度のトレードオフ |
-
-機密値は `src/secrets.h` を作って書き、Git には含めない (`.gitignore` 済み)。
+- Gemini Free Tier は **1 分あたりのリクエスト数**で制限される (`gemini-flash-lite-latest` は緩め、`gemini-2.5-flash` は厳しめ)。テストで連続叩くと 429 が出やすい。5 分間隔運用なら通常問題なし
+- Teams Incoming Webhook (Office 365 Connector) は廃止移行中。配信失敗時も HTTP 200 が返るので、body が `"1"` かを必ず確認すること
+- カメラに対して **背景が単色** (白い紙など) のほうが Gemini の検知精度が大幅に上がる。窓・カーテンなど明暗差が強いと中身の液体色が飛んでハルシネーションの原因になる
