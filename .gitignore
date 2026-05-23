@@ -1,0 +1,9 @@
+.pio/
+.vscode/
+.cache/
+*.swp
+.DS_Store
+
+# secrets — never commit
+secrets.h
+*.env
