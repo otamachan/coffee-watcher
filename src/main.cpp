@@ -175,8 +175,8 @@ static bool cameraInit() {
   cfg.pin_reset    = RESET_GPIO_NUM;
   cfg.xclk_freq_hz = 20000000;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_CIF;       // 352x288 (Teams payload を小さく保つ)
-  cfg.jpeg_quality = 15;
+  cfg.frame_size   = FRAMESIZE_VGA;       // 640x480 (Gemini と dashboard 用)
+  cfg.jpeg_quality = 12;
   cfg.fb_count     = 2;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
   cfg.grab_mode    = CAMERA_GRAB_LATEST;
@@ -434,7 +434,7 @@ static bool teamsPost(const char* title, const char* text,
   const int n = snprintf(payload, payload_cap,
     "{\"@type\":\"MessageCard\","
      "\"@context\":\"http://schema.org/extensions\","
-     "\"summary\":\"cam-watcher\","
+     "\"summary\":\"coffee-watcher\","
      "\"themeColor\":\"0078D4\","
      "\"title\":\"%s\","
      "\"text\":\"%s\","
@@ -509,6 +509,11 @@ static bool isActiveNow() {
   return tm.tm_hour >= kActiveStartHour && tm.tm_hour < kActiveEndHour;
 }
 
+// (前方宣言: 定義はファイル後方。runCheck から呼ぶため)
+static bool teamsPostThumb(const char* title, const char* text,
+                           const uint8_t* jpeg, size_t jpeg_len,
+                           uint16_t src_w, uint16_t src_h);
+
 // 1 サイクル: 撮影 → Gemini 推定 → イベント判定 → Teams 投稿 → NVS 更新。
 // force=true でアクティブ時間判定を無視する (手動 /check 用)。
 static void runCheck(bool force = false) {
@@ -575,10 +580,14 @@ static void runCheck(bool force = false) {
   // 3 イベントを優先度順に判定
   bool posted = false;
 
+  // 撮影は VGA で行っている前提
+  const uint16_t img_w = 640, img_h = 480;
+
   if (was_empty && !now_empty) {
     // (1) 新規ブリュー検知: 空 → 非空
     const String text = String("約 ") + cups_str + " 杯  — " + est.reason;
-    if (teamsPost("☕ 新しくコーヒーがはいりました！", text.c_str(), jpeg, jpeg_len)) {
+    if (teamsPostThumb("☕ 新しくコーヒーがはいりました！", text.c_str(),
+                       jpeg, jpeg_len, img_w, img_h)) {
       g_brew_epoch  = now_t;
       g_status_sent = false;
       posted = true;
@@ -589,7 +598,8 @@ static void runCheck(bool force = false) {
   } else if (!was_empty && now_empty) {
     // (3) 空検知: 非空 → 空
     const String text = String("残量ゼロ  — ") + est.reason;
-    if (teamsPost("☕ コーヒーがなくなりました！", text.c_str(), jpeg, jpeg_len)) {
+    if (teamsPostThumb("☕ コーヒーがなくなりました！", text.c_str(),
+                       jpeg, jpeg_len, img_w, img_h)) {
       g_status_sent = true;   // 念のため (status 重複防止)
       posted = true;
       logEvent("EVENT", "EMPTIED posted", false);
@@ -600,7 +610,8 @@ static void runCheck(bool force = false) {
              !now_empty && now_t >= g_brew_epoch + kStatusDelaySec) {
     // (2) 30 分経過の残量通知: ブリュー後 30 分以上経過、まだ未投稿、現在空でない
     const String text = String("残り約 ") + cups_str + " 杯です  — " + est.reason;
-    if (teamsPost("☕ コーヒー残量更新", text.c_str(), jpeg, jpeg_len)) {
+    if (teamsPostThumb("☕ コーヒー残量更新", text.c_str(),
+                       jpeg, jpeg_len, img_w, img_h)) {
       g_status_sent = true;
       posted = true;
       logEvent("EVENT", "STATUS posted", false);
@@ -621,6 +632,63 @@ static void runCheck(bool force = false) {
 
   free(jpeg);
   digitalWrite(kLedPin, HIGH);
+}
+
+// 撮影済み JPEG を 1/2 にスケールして再エンコードした小さい JPEG を返す。
+// Teams 投稿で Microsoft 側の Webhook が大ペイロードでハネる対策。
+// 失敗時 nullptr。返却ポインタは呼び出し側で free() すること。
+static uint8_t* jpegMakeThumb(const uint8_t* src, size_t src_len,
+                              uint16_t src_w, uint16_t src_h,
+                              uint8_t quality, size_t* out_len) {
+  const uint16_t dst_w = src_w / 2;
+  const uint16_t dst_h = src_h / 2;
+  const size_t rgb_len = static_cast<size_t>(dst_w) * dst_h * 2;  // RGB565
+  uint8_t* rgb = static_cast<uint8_t*>(ps_malloc(rgb_len));
+  if (!rgb) {
+    Serial.println("[thumb] ps_malloc rgb failed");
+    return nullptr;
+  }
+  if (!jpg2rgb565(src, src_len, rgb, JPG_SCALE_2X)) {
+    Serial.println("[thumb] jpg2rgb565 failed");
+    free(rgb);
+    return nullptr;
+  }
+  // jpg2rgb565 は MSB ファースト (big-endian) で書き出すが
+  // fmt2jpg(PIXFORMAT_RGB565) はリトルエンディアンを期待するため
+  // 2 バイト単位でスワップする。
+  for (size_t i = 0; i + 1 < rgb_len; i += 2) {
+    const uint8_t t = rgb[i];
+    rgb[i]     = rgb[i + 1];
+    rgb[i + 1] = t;
+  }
+  uint8_t* out = nullptr;
+  *out_len = 0;
+  if (!fmt2jpg(rgb, rgb_len, dst_w, dst_h, PIXFORMAT_RGB565, quality, &out, out_len)) {
+    Serial.println("[thumb] fmt2jpg failed");
+    free(rgb);
+    return nullptr;
+  }
+  free(rgb);
+  Serial.printf("[thumb] %ux%u %u B → %ux%u %u B\n",
+                src_w, src_h, (unsigned)src_len,
+                dst_w, dst_h, (unsigned)*out_len);
+  return out;
+}
+
+// Teams 投稿: 与えられた JPEG を縮小してから teamsPost を呼ぶ。
+// 縮小に失敗したら原本で投稿を試みる (Teams が受けてくれるかは別問題)。
+static bool teamsPostThumb(const char* title, const char* text,
+                           const uint8_t* jpeg, size_t jpeg_len,
+                           uint16_t src_w, uint16_t src_h) {
+  size_t thumb_len = 0;
+  uint8_t* thumb = jpegMakeThumb(jpeg, jpeg_len, src_w, src_h, 25, &thumb_len);
+  if (!thumb) {
+    Serial.println("[teams] thumb failed, falling back to original");
+    return teamsPost(title, text, jpeg, jpeg_len);
+  }
+  const bool ok = teamsPost(title, text, thumb, thumb_len);
+  free(thumb);
+  return ok;
 }
 
 static void handleJpg() {
@@ -644,7 +712,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.printf("\n=== cam-watcher boot ===\n");
+  Serial.printf("\n=== coffee-watcher boot ===\n");
   Serial.printf("Chip       : %s rev %d, %d cores @ %d MHz\n",
                 ESP.getChipModel(), ESP.getChipRevision(),
                 ESP.getChipCores(), ESP.getCpuFreqMHz());
@@ -832,7 +900,8 @@ void setup() {
       body = String("約 ") + cups_str + " 杯  — " + est.reason;
     }
 
-    const bool ok = teamsPost("☕ 現在のコーヒー残量", body.c_str(), jpeg, jpeg_len);
+    const bool ok = teamsPostThumb("☕ 現在のコーヒー残量", body.c_str(),
+                                   jpeg, jpeg_len, 640, 480);
     free(jpeg);
 
     if (server.hasArg("ui")) {
@@ -887,6 +956,24 @@ void setup() {
     server.send(200, "text/plain", "state cleared (RAM only)\n");
   });
   server.on("/jpg", HTTP_GET, handleJpg);
+  // デバッグ用: 現在の生 JPEG を縮小して返す (Teams に投げてる版と同じ)
+  server.on("/thumb.jpg", HTTP_GET, []() {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      server.send(500, "text/plain", "capture failed");
+      return;
+    }
+    size_t thumb_len = 0;
+    uint8_t* thumb = jpegMakeThumb(fb->buf, fb->len, fb->width, fb->height, 25, &thumb_len);
+    esp_camera_fb_return(fb);
+    if (!thumb) {
+      server.send(500, "text/plain", "thumb failed");
+      return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "image/jpeg", reinterpret_cast<const char*>(thumb), thumb_len);
+    free(thumb);
+  });
   server.on("/analyze", HTTP_GET, []() {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
@@ -925,9 +1012,9 @@ void setup() {
       server.send(500, "text/plain", "capture failed");
       return;
     }
-    const bool ok = teamsPost("cam-watcher test",
-                              "ESP32-CAM からのテスト投稿です。",
-                              fb->buf, fb->len);
+    const bool ok = teamsPostThumb("Coffee Watcher テスト投稿",
+                                   "ESP32-CAM からのテスト投稿です。",
+                                   fb->buf, fb->len, fb->width, fb->height);
     esp_camera_fb_return(fb);
     server.send(ok ? 200 : 500, "text/plain",
                 ok ? "posted OK\n" : "post FAILED\n");
@@ -956,8 +1043,8 @@ void setup() {
       body += String("RSSI: ") + WiFi.RSSI() + " dBm\n";
       body += String("MAC: ") + WiFi.macAddress() + "\n";
       if (ts[0]) body += String("起動時刻: ") + ts;
-      const bool ok = teamsPost("🟢 cam-watcher 起動",
-                                body.c_str(), jpeg, jpeg_len);
+      const bool ok = teamsPostThumb("🟢 Coffee Watcher 起動",
+                                     body.c_str(), jpeg, jpeg_len, 640, 480);
       Serial.printf("[boot] notification %s\n", ok ? "posted" : "FAILED");
       logEvent("BOOT", ok ? "notification posted" : "notification FAILED", !ok);
       free(jpeg);
