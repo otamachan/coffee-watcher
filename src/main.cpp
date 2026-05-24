@@ -1144,10 +1144,10 @@ void loop() {
   // LED heartbeat (non-blocking). We ideally want it to stay on during runCheck,
   // but for simplicity we let this loop run normally — and since runCheck is not
   // on a separate task, this loop doesn't execute during it anyway.
-  // Slow heartbeat: ~3 s cycle, 50 ms ON.
+  // Slow heartbeat: ~10 s cycle, 50 ms ON.
   static uint32_t last_blink = 0;
   static bool led_on = false;
-  const uint32_t blink_ms = led_on ? 50 : 2950;
+  const uint32_t blink_ms = led_on ? 50 : 9950;
   if (now - last_blink >= blink_ms) {
     led_on = !led_on;
     digitalWrite(kLedPin, led_on ? LOW : HIGH);
