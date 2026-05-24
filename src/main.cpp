@@ -33,7 +33,7 @@ static WebServer server(80);
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-static constexpr int kLedPin = 33;  // Blue LED on the Freenove board (GPIO33, LOW=ON)
+static constexpr int kLedPin = 2;  // User LED on Freenove ESP32 WROVER (GPIO2, HIGH=ON?)
 static constexpr const char* kTzInfo = "JST-9";
 static constexpr const char* kNtp1 = "ntp.nict.jp";
 static constexpr const char* kNtp2 = "pool.ntp.org";
@@ -1144,9 +1144,10 @@ void loop() {
   // LED heartbeat (non-blocking). We ideally want it to stay on during runCheck,
   // but for simplicity we let this loop run normally — and since runCheck is not
   // on a separate task, this loop doesn't execute during it anyway.
+  // Slow heartbeat: ~3 s cycle, 50 ms ON.
   static uint32_t last_blink = 0;
   static bool led_on = false;
-  const uint32_t blink_ms = led_on ? 50 : 950;
+  const uint32_t blink_ms = led_on ? 50 : 2950;
   if (now - last_blink >= blink_ms) {
     led_on = !led_on;
     digitalWrite(kLedPin, led_on ? LOW : HIGH);
