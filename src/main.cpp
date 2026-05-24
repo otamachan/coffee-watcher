@@ -800,7 +800,7 @@ void setup() {
       ".actions a.warn{background:#a04020}"
       ".log{font-family:monospace;font-size:.85em;border-collapse:collapse;width:100%}"
       ".log td{padding:.2em .4em;vertical-align:top;border-bottom:1px solid #eee}"
-      ".log td.t{color:#888;white-space:nowrap;width:7em}"
+      ".log td.t{color:#888;white-space:nowrap;width:10em}"
       ".log td.g{color:#555;white-space:nowrap;width:5em;font-weight:bold}"
       ".log tr.err td.g{color:#a02020}"
       ".log tr.err td.m{color:#a02020}"
@@ -870,11 +870,11 @@ void setup() {
       for (int i = 0; i < n; ++i) {
         const int idx = (g_log_next - 1 - i + kLogSize) % kLogSize;
         const LogEntry& e = g_log[idx];
-        char ts[16] = "--:--:--";
+        char ts[20] = "----- --:--:--";
         struct tm tm{};
         // Treat anything before 2020-01-01 (= 1577836800) as "NTP not yet synced"
         if (e.epoch > 1577836800 && localtime_r(&e.epoch, &tm)) {
-          strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+          strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tm);
         }
         html += e.error ? F("<tr class=\"err\">") : F("<tr>");
         html += F("<td class=\"t\">");
