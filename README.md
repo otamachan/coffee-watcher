@@ -1,42 +1,46 @@
 # Coffee Watcher
 
-ESP32-CAM 単体で動くコーヒーメーカーの残量ウォッチャー。
-定期的にコーヒーサーバーを撮影 → Google Gemini Vision で残量推定 → 状態変化があれば Microsoft Teams に通知。
+A standalone coffee-level monitor that runs entirely on an ESP32-CAM. It
+periodically photographs a drip-coffee carafe (coffee server), asks Google
+Gemini Vision how much coffee is left, and posts a notification to a Microsoft
+Teams channel whenever the state changes.
 
 ```
 [ESP32-CAM]
-   |  1) NTP 同期 (TLS 証明書検証に必須)
-   |  2) インターバル毎にカメラキャプチャ (VGA JPEG, PSRAM)
-   |  3) base64 化 → Gemini API (generateContent) へ HTTPS POST
-   |     (responseSchema で {cups_remaining, state, confidence, reason})
-   |  4) 前回観測 (RAM 保持) と比較しイベントを判定
-   |  5) BREWED / STATUS / EMPTIED のいずれかに該当すれば
-   |     Teams Incoming Webhook へ MessageCard で投稿
+   |  1) NTP sync (required for TLS certificate validation)
+   |  2) Capture JPEG (VGA in PSRAM) on a timer
+   |  3) Base64 encode and POST to Gemini's generateContent
+   |     (responseSchema returns {cups_remaining, state, confidence, reason})
+   |  4) Compare with the previous observation (kept in RAM)
+   |  5) On BREWED / STATUS / EMPTIED events, post to the
+   |     Microsoft Teams Incoming Webhook as a MessageCard
    v
 [loop]
 ```
 
-## なぜ ESP32 単体か
+## Why everything on a single ESP32?
 
-- 常時稼働の PC や SBC を置きたくない
-- クラウド関数も挟まず、デバイス 1 個で完結
-- 状態は **RAM のみ**で保持 (再起動時はリセット、再起動は稀という割り切り)
-- 代償: プロンプト/閾値の調整に再書き込みが要る (将来 LittleFS で動的化したい)
+- Avoid running a PC or SBC continuously
+- Skip cloud functions; the device is self-contained
+- State is held in **RAM only** (occasional reboots are acceptable)
+- Trade-off: prompt and threshold tweaks require a re-flash today
+  (LittleFS-based hot reload is on the roadmap)
 
-## ハードウェア (確認済み)
+## Hardware (confirmed)
 
 - **FREENOVE ESP32 WROVER (CAM)**
-- ESP32-WROVER-E モジュール (ESP32-D0WD-V3 rev 3, 2 cores @ 240 MHz)
-- Flash 4 MB / **PSRAM 4 MB** (起動時 free 約 4.19 MB)
-- USB-C 直付け / CH340 USB-TTL オンボード, 自動リセット (DTR→IO0 / RTS→EN)
-- カメラセンサ: **OV3660** (SCCB アドレス `0x3C`)
-- シリアル: `/dev/ttyUSB0` (VID:PID `1A86:7523`)
+- ESP32-WROVER-E module (ESP32-D0WD-V3 rev 3, dual core @ 240 MHz)
+- 4 MB Flash / **4 MB PSRAM** (~4.19 MB free after boot)
+- USB-C direct connection / onboard CH340 USB-to-serial, auto reset
+  (DTR → IO0 / RTS → EN)
+- Camera sensor: **OV3660** (SCCB address `0x3C`)
+- Serial port: `/dev/ttyUSB0` (VID:PID `1A86:7523`)
 
-### カメラ ピン定義 (Freenove)
+### Camera pin map (Freenove)
 
-| 信号 | GPIO |
+| Signal | GPIO |
 |---|---|
-| PWDN | -1 (未配線) |
+| PWDN | -1 (not wired) |
 | RESET | -1 |
 | XCLK | 21 |
 | SIOD (SDA) | 26 |
@@ -44,24 +48,27 @@ ESP32-CAM 単体で動くコーヒーメーカーの残量ウォッチャー。
 | Y2-Y9 | 4, 5, 18, 19, 36, 39, 34, 35 |
 | VSYNC / HREF / PCLK | 25 / 23 / 22 |
 
-## 外部サービス
+## External services
 
-- **Google Gemini API** (`gemini-flash-lite-latest`) — vision 推論、無料枠で運用
-  - 認証: `x-goog-api-key` ヘッダ
+- **Google Gemini API** (`gemini-flash-lite-latest`) — vision inference,
+  runs comfortably within the free tier
+  - Auth: `x-goog-api-key` header
   - TLS root: GTS Root R1
-- **Microsoft Teams Incoming Webhook** — Adaptive Card / MessageCard 投稿
+- **Microsoft Teams Incoming Webhook** — Adaptive Card / MessageCard posts
   - TLS root: DigiCert Global Root G2
-  - 配信成功判定: body == `"1"` (HTTP 200 は配信失敗時も返る)
+  - Delivery confirmation: body must equal `"1"`
+    (HTTP 200 is also returned on internal failures)
 
-## 開発環境
+## Development environment
 
 - OS: Ubuntu 24.04
-- ツール: PlatformIO Core 6.x (公式インストーラ経由、`~/.platformio/penv`)
-- フレームワーク: Arduino (espressif32 platform)
+- Tooling: PlatformIO Core 6.x (installed via the official installer at
+  `~/.platformio/penv`)
+- Framework: Arduino on the espressif32 platform
 
-### 初回セットアップ
+### First-time setup
 
-1. PlatformIO Core を導入 (sudo 不要)
+1. Install PlatformIO Core (no sudo required)
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/platformio/platformio-core-installer/master/get-platformio.py -o /tmp/get-platformio.py
@@ -71,7 +78,7 @@ ESP32-CAM 単体で動くコーヒーメーカーの残量ウォッチャー。
    pio --version
    ```
 
-2. USB シリアルへのアクセス権 (要 sudo・1 回だけ)
+2. Grant access to the USB serial port (sudo, one time)
 
    ```bash
    sudo usermod -aG dialout $USER
@@ -80,72 +87,106 @@ ESP32-CAM 単体で動くコーヒーメーカーの残量ウォッチャー。
    sudo udevadm control --reload-rules && sudo udevadm trigger
    ```
 
-   反映には再ログインが必要。即時に試したい場合は一時的に `sudo chmod a+rw /dev/ttyUSB0`。
+   Requires logging out and back in to take effect. For an immediate quick
+   fix, you can temporarily run `sudo chmod a+rw /dev/ttyUSB0`.
 
-3. `secrets.h` を作成 (Git 管理外)
+3. Create `secrets.h` (not tracked by Git)
 
    ```bash
    cp src/secrets.h.example src/secrets.h
-   # 編集して Wi-Fi / GEMINI_API_KEY / TEAMS_WEBHOOK_URL を埋める
+   # Edit to fill in Wi-Fi credentials, GEMINI_API_KEY, and TEAMS_WEBHOOK_URL_*
    ```
 
-4. 接続確認
+4. Verify the connection
 
    ```bash
    pio device list
-   # /dev/ttyUSB0 に "USB VID:PID=1A86:7523" が出れば OK
+   # /dev/ttyUSB0 should appear as "USB VID:PID=1A86:7523"
    ```
 
-## ビルド・書き込み・モニタ
+## Build, flash, and monitor
 
 ```bash
-pio run                 # ビルドのみ
-pio run -t upload       # ビルド + 書き込み
-pio device monitor      # シリアルモニタ (115200)
-pio run -t clean        # 中間物クリア
+pio run                 # Build only
+pio run -t upload       # Build + flash
+pio device monitor      # Serial monitor (115200)
+pio run -t clean        # Clean intermediates
 ```
 
-Freenove ESP32 WROVER は USB-C 経由で自動リセット・自動書き込みモードに入る。手動の boot/reset 操作は不要。
+The Freenove ESP32 WROVER auto-enters bootloader mode over USB-C; no manual
+boot/reset jumper is needed.
 
-## 実行時の動作
+## Runtime behavior
 
-起動シーケンス: チップ情報出力 → カメラ初期化 → Wi-Fi 接続 → NTP 同期 → 起動通知を Teams へ投稿。
+Boot sequence: print chip info → initialise the camera → connect to Wi-Fi →
+sync NTP → post a boot notification to Teams.
 
-その後 **平日 9:00-18:00 JST** のみ、**5 分間隔**で以下を繰り返す:
+After that, only during **weekdays 9:00–18:00 JST**, every **5 minutes**:
 
-1. JPEG キャプチャ
-2. Gemini に投げて構造化出力 (cups_remaining / state / confidence / reason) を取得
-3. confidence < 0.5 はスキップ
-4. 直前観測と比較しイベント判定
-5. 該当イベントがあれば Teams 投稿
+1. Capture a JPEG
+2. Send it to Gemini and parse the structured output
+   (cups_remaining / state / confidence / reason)
+3. Skip if confidence < 0.5
+4. Compare with the previous observation and decide whether to post
+5. Post to Teams on a matching event
 
-### イベント
+### Events
 
-| イベント | 条件 | Teams 投稿タイトル |
+| Event | Trigger | Teams post title |
 |---|---|---|
-| BREWED | 空 → 非空 | ☕ 新しくコーヒーがはいりました！ |
-| STATUS | BREWED から 30 分経過 (1 ブリューにつき 1 回) | ☕ コーヒー残量更新 |
-| EMPTIED | 非空 → 空 | ☕ コーヒーがなくなりました！ |
+| BREWED | empty → non-empty | ☕ 新しくコーヒーがはいりました！ |
+| STATUS | ≥ 30 min after BREWED (once per brew) | ☕ コーヒー残量更新 |
+| EMPTIED | non-empty → empty | ☕ コーヒーがなくなりました！ |
 
-### HTTP エンドポイント
+### Teams channel switching
 
-ブラウザは `http://<ESP32-IP>/` を開けば OK。
+`secrets.h` holds two webhook URLs (`TEAMS_WEBHOOK_URL_TEST`,
+`TEAMS_WEBHOOK_URL_PROD`). The active channel is stored in NVS
+(namespace `cw-cfg`, key `channel`) and survives reboots. Switch from the
+dashboard or via `GET /channel?to=test|prod`. Default is `test`.
 
-| パス | 用途 |
+### LED indication
+
+A single blue LED (GPIO 33) acts as a boot progress indicator and heartbeat:
+
+| Phase | Pattern |
 |---|---|
-| `GET /` | **ダッシュボード**: ライブ画像 + 最後の推論結果 + 操作ボタン (60s 自動リロード) |
-| `GET /jpg` | 撮りたて JPEG を返す (推論なし) |
-| `GET /last.jpg` | 最後に推論したときの JPEG (キャッシュ) |
-| `GET /analyze[?ui=1]` | 撮影 + Gemini 推論 (Teams 投稿なし)。`ui=1` で `/` にリダイレクト |
-| `GET /now[?ui=1]` | 撮影 + Gemini 推論 + Teams 投稿。同上 |
-| `GET /check` | 自動ループと同じ処理を 1 回強制実行 (デバッグ用) |
-| `GET /state` | 現在の RAM 状態を JSON で返す |
-| `GET /reset-state` | RAM 状態をクリア |
-| `GET /post` | 固定文言を Teams にテスト投稿 (Gemini を介さない) |
+| Boot → camera init | Off |
+| Camera ready | 1 short blink |
+| Wi-Fi connecting | Fast blink (50 ms on / 200 ms off) |
+| Wi-Fi connected | 2 short blinks |
+| NTP synced | 3 short blinks |
+| HTTP server up | 4 short blinks |
+| Boot notification posted | 5 short blinks |
+| Idle in loop | Heartbeat (50 ms flash every 1 s) |
+| Processing (analyze / Teams post) | Solid on |
+| Fatal error | Rapid continuous blink |
 
-## プロンプト
+### Dashboard / HTTP endpoints
 
-`src/main.cpp` 内の `kPrompt` に日本語で記述。`responseSchema` でフィールドを固定:
+Open `http://<ESP32-IP>/` to see the dashboard. It shows the latest live
+image, the last analyzed snapshot and inference result, the current Teams
+target channel, and a recent-event log (errors highlighted in red).
+
+| Path | Purpose |
+|---|---|
+| `GET /` | Dashboard (auto-refreshes every 60 s) |
+| `GET /jpg` | Fresh JPEG (no inference) |
+| `GET /last.jpg` | Cached JPEG from the last Gemini call |
+| `GET /thumb.jpg` | Downscaled Teams-style thumbnail (debug) |
+| `GET /analyze[?ui=1]` | Capture + Gemini inference (no Teams post). `ui=1` redirects back to `/` |
+| `GET /now[?ui=1]` | Capture + Gemini inference + Teams post. Same redirect option |
+| `GET /check` | Run the full pipeline cycle once (debug; bypasses active hours) |
+| `GET /state` | Current in-memory state as JSON |
+| `GET /reset-state` | Clear in-memory state |
+| `GET /channel[?to=test\|prod[&ui=1]]` | Show or switch the Teams target channel |
+| `GET /post` | Fixed-text Teams test post (no Gemini) |
+
+## Prompt
+
+Defined as `kPrompt` in `src/main.cpp`, intentionally written in Japanese
+since the response is rendered in Teams to Japanese-speaking users.
+`responseSchema` pins the output shape:
 
 ```
 ドリップ式コーヒーメーカーのコーヒーサーバー (ガラス製ポット) の画像です。
@@ -156,42 +197,55 @@ Freenove ESP32 WROVER は USB-C 経由で自動リセット・自動書き込み
 - reason: 日本語で 1 文の理由
 ```
 
-## プロジェクト構成
+## Project layout
 
 ```
 coffee-watcher/
-├── platformio.ini      # board=esp32cam, PSRAM 有効化, ttyUSB0
+├── platformio.ini      # board=esp32cam, enables PSRAM, ttyUSB0
 ├── src/
-│   ├── main.cpp        # 本体 (キャプチャ / Gemini / Teams / HTTP / ループ)
-│   ├── cert.h          # GTS Root R1 (Gemini) と DigiCert G2 (Teams)
-│   ├── secrets.h       # 機密値 (Git 除外)
+│   ├── main.cpp        # Firmware (capture / Gemini / Teams / HTTP / loop)
+│   ├── cert.h          # GTS Root R1 (Gemini) and DigiCert G2 (Teams)
+│   ├── secrets.h       # Secrets (Git-ignored)
 │   └── secrets.h.example
 └── README.md
 ```
 
-## secrets.h に必要な値
+## Required values in secrets.h
 
-| 名前 | 用途 |
+| Name | Purpose |
 |---|---|
-| `WIFI_SSID`, `WIFI_PASSWORD` | Wi-Fi 接続 |
-| `GEMINI_API_KEY` | Google AI Studio で発行 (`AIza...`) |
-| `TEAMS_WEBHOOK_URL` | Teams チャネルの Incoming Webhook URL |
+| `WIFI_SSID`, `WIFI_PASSWORD` | Wi-Fi connection |
+| `GEMINI_API_KEY` | Issued in Google AI Studio (`AIza...`) |
+| `TEAMS_WEBHOOK_URL_TEST` | Webhook URL for the test channel |
+| `TEAMS_WEBHOOK_URL_PROD` | Webhook URL for the production channel |
 
-## ロードマップ
+## Roadmap
 
-- [x] 開発環境構築 (PlatformIO)
+- [x] PlatformIO setup
 - [x] Wi-Fi + NTP
-- [x] カメラ初期化 (OV3660, VGA JPEG)
-- [x] Teams Webhook へ画像付き投稿 (data URI base64)
-- [x] Gemini API 疎通 + 残量推定 (構造化出力)
-- [x] パイプライン統合 + 3 イベント検知 (BREWED / STATUS / EMPTIED)
-- [x] アクティブ時間制限 (平日 9:00-18:00 JST)
-- [x] HTTP ダッシュボード
-- [ ] LittleFS でプロンプト / 閾値を再書き込みなしで更新
-- [ ] Wi-Fi 再接続 / 指数バックオフ / WDT / heap 監視
+- [x] Camera init (OV3660, VGA JPEG)
+- [x] Teams Webhook posts with inline base64 image
+- [x] Gemini API connectivity + structured-output level estimation
+- [x] Pipeline integration + 3-event detection (BREWED / STATUS / EMPTIED)
+- [x] Active-hours gating (weekdays 9:00–18:00 JST)
+- [x] HTTP dashboard with recent-event log
+- [x] Teams-only thumbnail (320×240) to dodge Microsoft's payload limits
+- [x] LED phase indication
+- [x] Channel switching with NVS persistence
+- [ ] LittleFS for hot-reloading prompt / thresholds
+- [ ] Wi-Fi auto-reconnect / exponential backoff / WDT / heap monitoring
 
-## 注意点
+## Gotchas
 
-- Gemini Free Tier は **1 分あたりのリクエスト数**で制限される (`gemini-flash-lite-latest` は緩め、`gemini-2.5-flash` は厳しめ)。テストで連続叩くと 429 が出やすい。5 分間隔運用なら通常問題なし
-- Teams Incoming Webhook (Office 365 Connector) は廃止移行中。配信失敗時も HTTP 200 が返るので、body が `"1"` かを必ず確認すること
-- カメラに対して **背景が単色** (白い紙など) のほうが Gemini の検知精度が大幅に上がる。窓・カーテンなど明暗差が強いと中身の液体色が飛んでハルシネーションの原因になる
+- The Gemini free tier is rate-limited *per minute* (`gemini-flash-lite-latest`
+  is generous; `gemini-2.5-flash` is much tighter). Continuous testing can
+  hit 429. The 5-minute production cadence is well under the limit.
+- The Microsoft Teams Incoming Webhook (Office 365 Connector) is being phased
+  out and sometimes returns HTTP 200 with a delivery-failure body. Always
+  check that the body equals `"1"`.
+- Teams' Webhook rejects very large payloads intermittently. The firmware
+  sends a 320×240 thumbnail (JPEG re-encoded after a 1/2 downscale) to Teams
+  while keeping the original VGA frame for Gemini and the dashboard.
+- A solid-color background (white sheet, etc.) behind the carafe dramatically
+  improves Gemini's accuracy. Strong backlight (a window, curtain) washes out
+  the coffee colour and triggers false "empty" readings.

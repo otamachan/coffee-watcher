@@ -1,11 +1,11 @@
 #pragma once
 
-// DigiCert Global Root G2 — Microsoft 365 / Teams Webhook の TLS チェーンが
-// ここに到達する。期限: 2038-01-15。
-// 出典: https://www.digicert.com/kb/digicert-root-certificates.htm
-// GTS Root R1 — Google Trust Services。Gemini API (generativelanguage.googleapis.com)
-// の TLS チェーンがここに到達する。期限: 2036-06-22。
-// 出典: https://pki.goog/repository/
+// DigiCert Global Root G2 — used by the Microsoft 365 / Teams Webhook TLS chain.
+// Valid until 2038-01-15.
+// Source: https://www.digicert.com/kb/digicert-root-certificates.htm
+// GTS Root R1 — Google Trust Services. The TLS chain for the Gemini API
+// (generativelanguage.googleapis.com) terminates here. Valid until 2036-06-22.
+// Source: https://pki.goog/repository/
 static const char GTS_ROOT_R1[] PROGMEM = R"PEM(
 -----BEGIN CERTIFICATE-----
 MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw

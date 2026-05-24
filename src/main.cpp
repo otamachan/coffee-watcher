@@ -33,32 +33,33 @@ static WebServer server(80);
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-static constexpr int kLedPin = 33;  // Freenove 基板上の青 LED (GPIO33, LOW=ON)
+static constexpr int kLedPin = 33;  // Blue LED on the Freenove board (GPIO33, LOW=ON)
 static constexpr const char* kTzInfo = "JST-9";
 static constexpr const char* kNtp1 = "ntp.nict.jp";
 static constexpr const char* kNtp2 = "pool.ntp.org";
 
-// パイプライン設定
+// Pipeline configuration
 static constexpr uint32_t kCheckIntervalMs = 5UL * 60 * 1000;  // 5 min
-static constexpr uint32_t kFirstCheckDelayMs = 10000;          // boot 後 10s
+static constexpr uint32_t kFirstCheckDelayMs = 10000;          // 10s after boot
 static constexpr float    kMinConfidence = 0.5f;
-static constexpr time_t   kStatusDelaySec = 30 * 60;            // 新規ブリュー後 30 分で残量通知
+static constexpr time_t   kStatusDelaySec = 30 * 60;            // Status notification 30 min after a new brew
 
-// アクティブ時間: 平日 9:00 (inclusive) - 18:00 (exclusive) JST
+// Active hours: weekdays 9:00 (inclusive) - 18:00 (exclusive) JST
 static constexpr int kActiveStartHour = 9;
 static constexpr int kActiveEndHour   = 18;
 
-// 状態 (RAM のみ。再起動でリセットされる前提)。
-//   g_last_state  : 直前の est.state ("empty" | "partial" | "full" | "")
-//   g_last_cups   : 直前の est.cups_remaining
-//   g_brew_epoch  : 直近の「空→非空」検知時の epoch (0 = 現在ブリュー無し or 未投稿)
-//   g_status_sent : 現ブリューの 30 分残量通知を投稿済みか
+// State (RAM only; resets on reboot by design).
+//   g_last_state  : last est.state ("empty" | "partial" | "full" | "")
+//   g_last_cups   : last est.cups_remaining
+//   g_brew_epoch  : epoch of the last "empty -> non-empty" detection
+//                   (0 = no active brew or status not yet posted)
+//   g_status_sent : whether the 30-min status notification has been posted for the current brew
 static String  g_last_state;
 static float   g_last_cups   = -1.0f;
 static time_t  g_brew_epoch  = 0;
 static bool    g_status_sent = false;
 
-// 最後に Gemini に解析を依頼した画像と結果のキャッシュ (HTTP / ダッシュボード用)。
+// Cache of the last image and result sent to Gemini (used by HTTP / dashboard).
 static uint8_t* g_cached_jpeg     = nullptr;
 static size_t   g_cached_jpeg_len = 0;
 static time_t   g_cached_epoch    = 0;
@@ -67,7 +68,7 @@ static float    g_cached_cups       = 0.0f;
 static float    g_cached_confidence = 0.0f;
 static String   g_cached_reason;
 
-// Teams 投稿先チャネル ("test" or "prod")。NVS に永続化。
+// Teams target channel ("test" or "prod"). Persisted to NVS.
 static Preferences prefsCfg;
 static String g_channel = "test";
 
@@ -90,7 +91,7 @@ static void saveChannel(const String& ch) {
   prefsCfg.end();
 }
 
-// 最近のイベントログ (リングバッファ、シリアルに繋がなくてもダッシュボードで見れる)。
+// Recent event log (ring buffer; visible on the dashboard without serial).
 struct LogEntry {
   time_t epoch = 0;
   String tag;       // BOOT / WIFI / NTP / TEAMS / GEMINI / CHECK / EVENT
@@ -99,8 +100,8 @@ struct LogEntry {
 };
 static constexpr int kLogSize = 16;
 static LogEntry g_log[kLogSize];
-static int      g_log_next = 0;   // 次に書き込むインデックス
-static int      g_log_count = 0;  // 累計 (上限なし、表示は最新 kLogSize 件)
+static int      g_log_next = 0;   // Next write index
+static int      g_log_count = 0;  // Cumulative count (unbounded; dashboard renders latest kLogSize entries)
 
 static void logEvent(const char* tag, const String& msg, bool is_error = false) {
   g_log[g_log_next].epoch   = time(nullptr);
@@ -121,8 +122,8 @@ static void blinkFast(int times) {
   }
 }
 
-// フェーズ完了の合図: 短い点滅 N 回 + 待ち。
-// 1=Camera, 2=Wi-Fi, 3=NTP, 4=HTTP, 5=Boot 通知完了 (起動シーケンス完了)。
+// Phase-complete blink ack: N short pulses followed by a pause.
+// 1=Camera, 2=Wi-Fi, 3=NTP, 4=HTTP, 5=Boot notification (full boot sequence done).
 static void blinkAck(int times) {
   for (int i = 0; i < times; ++i) {
     digitalWrite(kLedPin, LOW);
@@ -130,7 +131,7 @@ static void blinkAck(int times) {
     digitalWrite(kLedPin, HIGH);
     delay(120);
   }
-  delay(400);  // 次のフェーズと視覚的に区別するための間
+  delay(400);  // Visual gap before the next phase
 }
 
 static bool connectWifi(uint32_t timeout_ms = 20000) {
@@ -145,10 +146,10 @@ static bool connectWifi(uint32_t timeout_ms = 20000) {
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - t0 > timeout_ms) {
       Serial.printf("\n[wifi] connect TIMEOUT (status=%d)\n", WiFi.status());
-      digitalWrite(kLedPin, HIGH);  // 消灯して終了
+      digitalWrite(kLedPin, HIGH);  // Turn LED off before returning
       return false;
     }
-    // 接続中は速い点滅 (50ms ON / 200ms OFF) で「探索中」を視覚化
+    // Fast blink (50ms ON / 200ms OFF) to indicate "searching"
     digitalWrite(kLedPin, LOW);
     delay(50);
     digitalWrite(kLedPin, HIGH);
@@ -199,7 +200,7 @@ static bool cameraInit() {
   cfg.pin_reset    = RESET_GPIO_NUM;
   cfg.xclk_freq_hz = 20000000;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;       // 640x480 (Gemini と dashboard 用)
+  cfg.frame_size   = FRAMESIZE_VGA;       // 640x480 (used by Gemini and dashboard)
   cfg.jpeg_quality = 12;
   cfg.fb_count     = 2;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -211,13 +212,13 @@ static bool cameraInit() {
     return false;
   }
 
-  // センサ姿勢: 左右反転を反転させる。OV3660 のデフォルト動作確認も兼ねる。
+  // Sensor orientation: enable horizontal mirror so text on the carafe reads correctly.
   if (sensor_t* s = esp_camera_sensor_get()) {
-    s->set_hmirror(s, 1);  // ← 0 から 1 に切り替えて比較
+    s->set_hmirror(s, 1);
     s->set_vflip(s, 0);
   }
 
-  // ウォームアップ用に 1 枚捨てる。
+  // Discard the first frame to let the sensor warm up.
   camera_fb_t* fb = esp_camera_fb_get();
   if (fb) esp_camera_fb_return(fb);
 
@@ -228,7 +229,7 @@ static bool cameraInit() {
   return true;
 }
 
-// HTML 表示用エスケープ。
+// HTML-escape for safe rendering in the dashboard.
 static String htmlEscape(const String& in) {
   String out;
   out.reserve(in.length() + 8);
@@ -243,7 +244,7 @@ static String htmlEscape(const String& in) {
   return out;
 }
 
-// JSON 文字列に埋め込む前のエスケープ。" と \ と制御文字をエスケープ。
+// JSON string escape: handles " and \ and control characters.
 static String jsonEscape(const String& in) {
   String out;
   out.reserve(in.length() + 8);
@@ -272,7 +273,7 @@ struct CoffeeEstimate {
   String error;
 };
 
-// 直近の解析結果と画像を PSRAM にキャッシュ (HTTP `/` 用)。
+// Cache the latest analysis result and image in PSRAM (used by HTTP `/`).
 static void cacheLatest(const uint8_t* jpeg, size_t len, const CoffeeEstimate& est) {
   if (g_cached_jpeg) {
     free(g_cached_jpeg);
@@ -294,12 +295,12 @@ static void cacheLatest(const uint8_t* jpeg, size_t len, const CoffeeEstimate& e
   g_cached_reason     = est.reason;
 }
 
-// Gemini 2.0 Flash の generateContent に JPEG + プロンプトを投げ、
-// responseSchema 経由で構造化 JSON を取り出す。
+// Send a JPEG + prompt to Gemini's generateContent and extract the
+// structured JSON output via responseSchema.
 static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
   CoffeeEstimate r;
 
-  // 1. base64 エンコード (PSRAM)
+  // 1. Base64 encode (in PSRAM)
   size_t b64_olen = 0;
   mbedtls_base64_encode(nullptr, 0, &b64_olen, jpeg, jpeg_len);
   uint8_t* b64 = static_cast<uint8_t*>(ps_malloc(b64_olen + 1));
@@ -311,7 +312,7 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
   }
   b64[b64_olen] = 0;
 
-  // 2. リクエスト JSON を PSRAM に組み立て
+  // 2. Build the request JSON in PSRAM
   static const char* kPrompt =
     "ドリップ式コーヒーメーカーのコーヒーサーバー (ガラス製ポット) の画像です。"
     "コーヒーの残量を推定して、スキーマに沿った JSON で返してください。"
@@ -380,7 +381,7 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
   if (code != 200) {
     r.error = "HTTP " + String(code);
     Serial.printf("[gemini] err: %s\n", resp.substring(0, 500).c_str());
-    // 短い要約だけログ化 (429 の "Please retry in X" 部分など)
+    // Log a short summary (e.g., the "Please retry in X" part of 429 errors)
     String snippet = resp;
     snippet.replace("\n", " ");
     if (snippet.length() > 120) snippet = snippet.substring(0, 117) + "...";
@@ -388,7 +389,7 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
     return r;
   }
 
-  // 4. 外側 JSON をパース
+  // 4. Parse the outer JSON
   JsonDocument outer;
   if (DeserializationError err = deserializeJson(outer, resp)) {
     r.error = String("outer json: ") + err.c_str();
@@ -401,7 +402,7 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
     return r;
   }
 
-  // 5. 内側構造化 JSON (responseSchema で保証されてる)
+  // 5. Parse the inner structured JSON (guaranteed by responseSchema)
   JsonDocument inner;
   if (DeserializationError err = deserializeJson(inner, inner_text)) {
     r.error = String("inner json: ") + err.c_str();
@@ -426,11 +427,11 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
   return r;
 }
 
-// JPEG を Teams Incoming Webhook へ inline base64 (data URI) で投稿。
-// payload は PSRAM に確保して内部 RAM 圧迫を避ける。
+// Post a JPEG to the Teams Incoming Webhook inline as a base64 data URI.
+// The payload is allocated in PSRAM to avoid pressuring the internal heap.
 static bool teamsPost(const char* title, const char* text,
                       const uint8_t* jpeg, size_t jpeg_len) {
-  // 1. base64 エンコード
+  // 1. Base64 encode
   size_t b64_olen = 0;
   mbedtls_base64_encode(nullptr, 0, &b64_olen, jpeg, jpeg_len);
   uint8_t* b64 = static_cast<uint8_t*>(ps_malloc(b64_olen + 1));
@@ -445,7 +446,7 @@ static bool teamsPost(const char* title, const char* text,
   }
   b64[b64_olen] = 0;
 
-  // 2. JSON payload を組み立て (MessageCard)
+  // 2. Build the JSON payload (MessageCard)
   const size_t payload_cap = b64_olen + 1024;
   char* payload = static_cast<char*>(ps_malloc(payload_cap));
   if (!payload) {
@@ -494,7 +495,7 @@ static bool teamsPost(const char* title, const char* text,
   http.end();
   free(payload);
 
-  // raw body を hex まで出して原因切り分けを容易にする (空白・改行検知用)。
+  // Dump the raw body as text and hex to make root-cause analysis easier (detects whitespace/newlines).
   Serial.printf("[teams] HTTP %d  %u ms  resp_len=%u\n", code, dt, resp.length());
   Serial.print("[teams] resp(text): ");
   Serial.println(resp.substring(0, 200));
@@ -504,8 +505,8 @@ static bool teamsPost(const char* title, const char* text,
   }
   Serial.println();
 
-  // Incoming Webhook は配信成功時 body が "1" (Microsoft はたまに前後に
-  // 空白/改行を付けてくる可能性があるので trim してから比較)。
+  // Incoming Webhook returns body "1" on successful delivery. Trim before
+  // comparing in case Microsoft surrounds it with whitespace or newlines.
   String trimmed = resp;
   trimmed.trim();
   const bool delivered = (code >= 200 && code < 300) && (trimmed == "1");
@@ -525,7 +526,7 @@ static bool teamsPost(const char* title, const char* text,
   return delivered;
 }
 
-// 平日 (Mon-Fri) かつ 9:00-18:00 JST かを判定。NTP 未同期だと false。
+// Returns true if it's a weekday (Mon-Fri) and 9:00-18:00 JST. False if NTP is not yet synced.
 static bool isActiveNow() {
   struct tm tm{};
   if (!getLocalTime(&tm, 0)) return false;
@@ -533,20 +534,20 @@ static bool isActiveNow() {
   return tm.tm_hour >= kActiveStartHour && tm.tm_hour < kActiveEndHour;
 }
 
-// (前方宣言: 定義はファイル後方。runCheck から呼ぶため)
+// (Forward declaration: defined later in the file but called from runCheck)
 static bool teamsPostThumb(const char* title, const char* text,
                            const uint8_t* jpeg, size_t jpeg_len,
                            uint16_t src_w, uint16_t src_h);
 
-// 1 サイクル: 撮影 → Gemini 推定 → イベント判定 → Teams 投稿 → NVS 更新。
-// force=true でアクティブ時間判定を無視する (手動 /check 用)。
+// One cycle: capture → Gemini inference → event detection → Teams post → state update.
+// force=true bypasses the active-hours check (used by manual /check).
 static void runCheck(bool force = false) {
   if (!force && !isActiveNow()) {
     Serial.println("[check] outside active hours; skip");
     return;
   }
   Serial.println("[check] start");
-  digitalWrite(kLedPin, LOW);  // 処理中は LED 点灯
+  digitalWrite(kLedPin, LOW);  // LED solid on while processing
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
@@ -591,7 +592,7 @@ static void runCheck(bool force = false) {
                 g_last_state.c_str(), g_last_cups,
                 static_cast<long>(g_brew_epoch));
 
-  // 初回観測は無音で状態だけ記録 (起動時点が brew 途中の可能性があるため)
+  // First observation: record the state silently (the boot moment may be mid-brew)
   if (first_run) {
     g_last_state = est.state;
     g_last_cups  = est.cups_remaining;
@@ -601,14 +602,14 @@ static void runCheck(bool force = false) {
     return;
   }
 
-  // 3 イベントを優先度順に判定
+  // Evaluate the 3 events in priority order
   bool posted = false;
 
-  // 撮影は VGA で行っている前提
+  // Capture is assumed to be VGA
   const uint16_t img_w = 640, img_h = 480;
 
   if (was_empty && !now_empty) {
-    // (1) 新規ブリュー検知: 空 → 非空
+    // (1) New brew detected: empty -> non-empty
     const String text = String("約 ") + cups_str + " 杯  — " + est.reason;
     if (teamsPostThumb("☕ 新しくコーヒーがはいりました！", text.c_str(),
                        jpeg, jpeg_len, img_w, img_h)) {
@@ -620,11 +621,11 @@ static void runCheck(bool force = false) {
       logEvent("EVENT", "BREWED post failed; will retry next cycle", true);
     }
   } else if (!was_empty && now_empty) {
-    // (3) 空検知: 非空 → 空
+    // (3) Empty detected: non-empty -> empty
     const String text = String("残量ゼロ  — ") + est.reason;
     if (teamsPostThumb("☕ コーヒーがなくなりました！", text.c_str(),
                        jpeg, jpeg_len, img_w, img_h)) {
-      g_status_sent = true;   // 念のため (status 重複防止)
+      g_status_sent = true;   // Belt and suspenders: prevent duplicate status post
       posted = true;
       logEvent("EVENT", "EMPTIED posted", false);
     } else {
@@ -632,7 +633,7 @@ static void runCheck(bool force = false) {
     }
   } else if (g_brew_epoch > 0 && !g_status_sent &&
              !now_empty && now_t >= g_brew_epoch + kStatusDelaySec) {
-    // (2) 30 分経過の残量通知: ブリュー後 30 分以上経過、まだ未投稿、現在空でない
+    // (2) Post-brew status: >= 30 minutes after brew, not yet posted, currently not empty
     const String text = String("残り約 ") + cups_str + " 杯です  — " + est.reason;
     if (teamsPostThumb("☕ コーヒー残量更新", text.c_str(),
                        jpeg, jpeg_len, img_w, img_h)) {
@@ -646,7 +647,7 @@ static void runCheck(bool force = false) {
     Serial.println("[check] no event");
   }
 
-  // post 失敗で状態が変わるケースは更新しない (次サイクルで retry)。
+  // If a transition post failed, don't update last_state so the next cycle can retry.
   if (posted || (was_empty == now_empty)) {
     g_last_state = est.state;
     g_last_cups  = est.cups_remaining;
@@ -658,9 +659,9 @@ static void runCheck(bool force = false) {
   digitalWrite(kLedPin, HIGH);
 }
 
-// 撮影済み JPEG を 1/2 にスケールして再エンコードした小さい JPEG を返す。
-// Teams 投稿で Microsoft 側の Webhook が大ペイロードでハネる対策。
-// 失敗時 nullptr。返却ポインタは呼び出し側で free() すること。
+// Produce a smaller JPEG by decoding, scaling 1/2, and re-encoding.
+// Workaround for Microsoft's Teams Webhook rejecting large image payloads.
+// Returns nullptr on failure. Caller must free() the returned buffer.
 static uint8_t* jpegMakeThumb(const uint8_t* src, size_t src_len,
                               uint16_t src_w, uint16_t src_h,
                               uint8_t quality, size_t* out_len) {
@@ -677,9 +678,8 @@ static uint8_t* jpegMakeThumb(const uint8_t* src, size_t src_len,
     free(rgb);
     return nullptr;
   }
-  // jpg2rgb565 は MSB ファースト (big-endian) で書き出すが
-  // fmt2jpg(PIXFORMAT_RGB565) はリトルエンディアンを期待するため
-  // 2 バイト単位でスワップする。
+  // jpg2rgb565 writes MSB-first (big-endian), but fmt2jpg(PIXFORMAT_RGB565)
+  // expects little-endian. Swap each 2-byte pixel to match.
   for (size_t i = 0; i + 1 < rgb_len; i += 2) {
     const uint8_t t = rgb[i];
     rgb[i]     = rgb[i + 1];
@@ -699,8 +699,8 @@ static uint8_t* jpegMakeThumb(const uint8_t* src, size_t src_len,
   return out;
 }
 
-// Teams 投稿: 与えられた JPEG を縮小してから teamsPost を呼ぶ。
-// 縮小に失敗したら原本で投稿を試みる (Teams が受けてくれるかは別問題)。
+// Post to Teams using a downscaled thumbnail of the given JPEG.
+// Falls back to the original on resize failure (Teams may still reject it).
 static bool teamsPostThumb(const char* title, const char* text,
                            const uint8_t* jpeg, size_t jpeg_len,
                            uint16_t src_w, uint16_t src_h) {
@@ -807,14 +807,14 @@ void setup() {
       "</style></head><body>"
       "<h1>☕ Coffee Watcher</h1>");
 
-    // 現在のライブカメラ画像 (cache buster 付き)。
+    // Live camera image (with a cache buster).
     const uint32_t now_ms = millis();
     html += F("<h2>今の様子 (ライブ)</h2>");
     html += F("<img src=\"/jpg?t=");
     html += String(now_ms);
     html += F("\" alt=\"live\">");
 
-    // 最後の推論結果。
+    // Last inference result.
     html += F("<h2>最後の推論</h2>");
     if (g_cached_jpeg && g_cached_epoch > 0) {
       html += F("<img src=\"/last.jpg\" alt=\"last analyzed\">");
@@ -847,7 +847,7 @@ void setup() {
       "<a class=\"warn\" href=\"/now?ui=1\">推論を更新 + Teams 投稿</a>"
       "</div>");
 
-    // 投稿先チャネル
+    // Posting channel
     html += F("<h2>Teams 投稿先</h2>");
     html += F("<p>現在: <b>");
     html += htmlEscape(g_channel);
@@ -859,20 +859,20 @@ void setup() {
     }
     html += F("</div>");
 
-    // 最近のイベントログ (新しい順)。
+    // Recent event log (newest first).
     html += F("<h2>最近のイベント</h2>");
     if (g_log_count == 0) {
       html += F("<p class=\"nodata\">まだイベントなし</p>");
     } else {
       html += F("<table class=\"log\">");
-      // ring buffer の最新→過去の順で走査
+      // Iterate the ring buffer from newest to oldest
       const int n = (g_log_count < kLogSize) ? g_log_count : kLogSize;
       for (int i = 0; i < n; ++i) {
         const int idx = (g_log_next - 1 - i + kLogSize) % kLogSize;
         const LogEntry& e = g_log[idx];
         char ts[16] = "--:--:--";
         struct tm tm{};
-        // 2020-01-01 = 1577836800 以前は NTP 未同期とみなす
+        // Treat anything before 2020-01-01 (= 1577836800) as "NTP not yet synced"
         if (e.epoch > 1577836800 && localtime_r(&e.epoch, &tm)) {
           strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
         }
@@ -904,7 +904,7 @@ void setup() {
                   reinterpret_cast<const char*>(g_cached_jpeg),
                   g_cached_jpeg_len);
   });
-  // 手動: 今の残量を Teams に投稿 (NVS 状態には影響しない、イベント判定もしない)。
+  // Manual: post the current level to Teams (does not touch state or event detection).
   server.on("/now", HTTP_GET, []() {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
@@ -963,7 +963,7 @@ void setup() {
   });
 
   server.on("/check", HTTP_GET, []() {
-    runCheck(true);  // 手動はアクティブ時間外でも動かす
+    runCheck(true);  // Manual run bypasses the active-hours check
     JsonDocument out;
     out["last_state"]    = g_last_state;
     out["last_cups"]     = g_last_cups;
@@ -1020,7 +1020,7 @@ void setup() {
   });
 
   server.on("/jpg", HTTP_GET, handleJpg);
-  // デバッグ用: 現在の生 JPEG を縮小して返す (Teams に投げてる版と同じ)
+  // Debug: capture a JPEG, downscale it, and return (same output as the Teams thumbnail)
   server.on("/thumb.jpg", HTTP_GET, []() {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
@@ -1086,10 +1086,10 @@ void setup() {
   server.begin();
   Serial.printf("[http] http://%s/\n", WiFi.localIP().toString().c_str());
   logEvent("HTTP", String("server up at http://") + WiFi.localIP().toString() + "/", false);
-  blinkAck(4);  // HTTP server up — 以後はブラウザでログ閲覧可
+  blinkAck(4);  // HTTP server up — log is browsable from a browser from here on
 
-  // 起動通知 (現在のカメラ画像 + IP / RSSI)。
-  // 致命的な初期化失敗時はここに到達しないので、起動成功の証跡を兼ねる。
+  // Boot notification (current camera image + IP / RSSI).
+  // Fatal init failures never reach here, so this also serves as proof of a successful boot.
   if (camera_fb_t* fb = esp_camera_fb_get()) {
     uint8_t* jpeg = static_cast<uint8_t*>(ps_malloc(fb->len));
     const size_t jpeg_len = fb->len;
@@ -1112,7 +1112,7 @@ void setup() {
       Serial.printf("[boot] notification %s\n", ok ? "posted" : "FAILED");
       logEvent("BOOT", ok ? "notification posted" : "notification FAILED", !ok);
       free(jpeg);
-      blinkAck(5);  // 起動シーケンス完了 (Boot 通知の成否は問わず)
+      blinkAck(5);  // Boot sequence complete (regardless of notification success)
     } else {
       esp_camera_fb_return(fb);
       Serial.println("[boot] notification: ps_malloc failed");
@@ -1124,14 +1124,14 @@ void loop() {
   server.handleClient();
   const uint32_t now = millis();
 
-  // パイプライン: 起動 10 秒後に初回、その後 kCheckIntervalMs ごと。
+  // Pipeline: first run 10s after boot, then every kCheckIntervalMs.
   static uint32_t next_check = kFirstCheckDelayMs;
   if (now >= next_check) {
     next_check = now + kCheckIntervalMs;
     runCheck();
   }
 
-  // 30 秒ごとに alive ログ。
+  // Alive log every 30s.
   static uint32_t next_tick = 0;
   if (now >= next_tick) {
     next_tick = now + 30000;
@@ -1141,9 +1141,9 @@ void loop() {
                   g_last_state.c_str(), g_last_cups);
   }
 
-  // LED ハートビート (non-blocking)。runCheck 中は LED 点灯のままにしたいが
-  // 簡略化のためそのまま流して点滅させる (runCheck の間は別タスクではないので
-  // この loop は走らない)。
+  // LED heartbeat (non-blocking). We ideally want it to stay on during runCheck,
+  // but for simplicity we let this loop run normally — and since runCheck is not
+  // on a separate task, this loop doesn't execute during it anyway.
   static uint32_t last_blink = 0;
   static bool led_on = false;
   const uint32_t blink_ms = led_on ? 50 : 950;
