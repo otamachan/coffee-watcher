@@ -12,8 +12,10 @@ Teams channel whenever the state changes.
    |  3) Base64 encode and POST to Gemini's generateContent
    |     (responseSchema returns {cups_remaining, state, confidence, reason})
    |  4) Compare with the previous observation (kept in RAM)
-   |  5) On BREWED / STATUS / EMPTIED events, post to the
-   |     Microsoft Teams Incoming Webhook as a MessageCard
+   |  5) On BREWED / STATUS / EMPTIED events:
+   |        a) downscale JPEG to 320x240 and upload to uguu.se (multipart)
+   |        b) build an Adaptive Card referencing the uguu URL
+   |        c) POST the card to a Power Automate (Teams Workflow) HTTP trigger
    v
 [loop]
 ```
@@ -54,10 +56,18 @@ Teams channel whenever the state changes.
   runs comfortably within the free tier
   - Auth: `x-goog-api-key` header
   - TLS root: GTS Root R1
-- **Microsoft Teams Incoming Webhook** — Adaptive Card / MessageCard posts
-  - TLS root: DigiCert Global Root G2
-  - Delivery confirmation: body must equal `"1"`
-    (HTTP 200 is also returned on internal failures)
+- **Power Automate (Teams Workflow) HTTP trigger** — receives an Adaptive
+  Card JSON body and forwards it to "Post card in a chat or channel"
+  - Replaces the now-retired Office 365 Incoming Webhook (Connector)
+  - TLS root: DigiCert Global Root G2 (chain: `*.powerplatform.com` →
+    Microsoft TLS RSA Root G2 → DigiCert Global Root G2)
+  - Delivery confirmation: trigger returns HTTP 202 (acceptance only).
+    Card-rendering failures only surface in the Power Automate run history.
+- **uguu.se** — short-lived public image host (a few hours) used to give
+  Teams a URL it can fetch for the Adaptive Card `Image` element
+  - Posted via `multipart/form-data` to `https://uguu.se/upload`
+  - TLS is `setInsecure()` since the image carries no secret and uguu's
+    ZeroSSL chain isn't pinned in `cert.h`
 
 ## Development environment
 
@@ -134,20 +144,26 @@ After that, only during **weekdays 9:00–18:00 JST**, every **5 minutes**:
 
 | Event | Trigger | Teams post title |
 |---|---|---|
-| BREWED | empty → non-empty | ☕ 新しくコーヒーがはいりました！ |
+| BREWED | empty → non-empty **and** `cups_remaining ≥ 3.0` | ☕ 新しくコーヒーがはいりました！ |
 | STATUS | ≥ 30 min after BREWED (once per brew) | ☕ コーヒー残量更新 |
 | EMPTIED | non-empty → empty | ☕ コーヒーがなくなりました！ |
 
+The cups threshold prevents a notification firing during the drip phase
+when the carafe is only partway filled — sub-threshold observations leave
+the recorded state at `empty` so subsequent cycles keep re-evaluating.
+
 ### Teams channel switching
 
-`secrets.h` holds two webhook URLs (`TEAMS_WEBHOOK_URL_TEST`,
-`TEAMS_WEBHOOK_URL_PROD`). The active channel is stored in NVS
-(namespace `cw-cfg`, key `channel`) and survives reboots. Switch from the
-dashboard or via `GET /channel?to=test|prod`. Default is `test`.
+`secrets.h` holds two Workflow URLs (`TEAMS_WEBHOOK_URL_TEST`,
+`TEAMS_WEBHOOK_URL_PROD`; the names are kept for continuity). The active
+channel is stored in NVS (namespace `cw-cfg`, key `channel`) and survives
+reboots. Switch from the dashboard or via `GET /channel?to=test|prod`.
+Default is `test`.
 
 ### LED indication
 
-A single blue LED (GPIO 33) acts as a boot progress indicator and heartbeat:
+The onboard user LED (GPIO 2, labelled "IO2" on the Freenove silkscreen)
+acts as a boot progress indicator and heartbeat:
 
 | Phase | Pattern |
 |---|---|
@@ -158,7 +174,7 @@ A single blue LED (GPIO 33) acts as a boot progress indicator and heartbeat:
 | NTP synced | 3 short blinks |
 | HTTP server up | 4 short blinks |
 | Boot notification posted | 5 short blinks |
-| Idle in loop | Heartbeat (50 ms flash every 1 s) |
+| Idle in loop | Heartbeat (~50 ms flash every 10 s) |
 | Processing (analyze / Teams post) | Solid on |
 | Fatal error | Rapid continuous blink |
 
@@ -216,20 +232,22 @@ coffee-watcher/
 |---|---|
 | `WIFI_SSID`, `WIFI_PASSWORD` | Wi-Fi connection |
 | `GEMINI_API_KEY` | Issued in Google AI Studio (`AIza...`) |
-| `TEAMS_WEBHOOK_URL_TEST` | Webhook URL for the test channel |
-| `TEAMS_WEBHOOK_URL_PROD` | Webhook URL for the production channel |
+| `TEAMS_WEBHOOK_URL_TEST` | Power Automate HTTP-trigger URL for the test channel |
+| `TEAMS_WEBHOOK_URL_PROD` | Power Automate HTTP-trigger URL for the production channel |
 
 ## Roadmap
 
 - [x] PlatformIO setup
 - [x] Wi-Fi + NTP
 - [x] Camera init (OV3660, VGA JPEG)
-- [x] Teams Webhook posts with inline base64 image
+- [x] Teams posts with image (originally Incoming Webhook + inline base64;
+      migrated to Power Automate Workflow + uguu URL)
 - [x] Gemini API connectivity + structured-output level estimation
 - [x] Pipeline integration + 3-event detection (BREWED / STATUS / EMPTIED)
+- [x] BREWED cups threshold to avoid drip-phase notifications
 - [x] Active-hours gating (weekdays 9:00–18:00 JST)
 - [x] HTTP dashboard with recent-event log
-- [x] Teams-only thumbnail (320×240) to dodge Microsoft's payload limits
+- [x] Downscaled 320×240 thumbnail for the uguu upload
 - [x] LED phase indication
 - [x] Channel switching with NVS persistence
 - [ ] LittleFS for hot-reloading prompt / thresholds
@@ -240,12 +258,19 @@ coffee-watcher/
 - The Gemini free tier is rate-limited *per minute* (`gemini-flash-lite-latest`
   is generous; `gemini-2.5-flash` is much tighter). Continuous testing can
   hit 429. The 5-minute production cadence is well under the limit.
-- The Microsoft Teams Incoming Webhook (Office 365 Connector) is being phased
-  out and sometimes returns HTTP 200 with a delivery-failure body. Always
-  check that the body equals `"1"`.
-- Teams' Webhook rejects very large payloads intermittently. The firmware
-  sends a 320×240 thumbnail (JPEG re-encoded after a 1/2 downscale) to Teams
-  while keeping the original VGA frame for Gemini and the dashboard.
+- The Power Automate HTTP trigger returns **HTTP 202 on acceptance only** —
+  it tells you the flow received your request, not that Teams rendered the
+  card. Card-shape mismatches surface only in the flow's run history. The
+  body MUST be a full Adaptive Card (`{"type":"AdaptiveCard", ...}`); the
+  flow is configured to hand the request body verbatim to "Post card in a
+  chat or channel".
+- Inline base64 in Adaptive Card `Image.url` (`data:image/...;base64,...`)
+  is silently stripped by Teams' renderer, which is why we host the image
+  on uguu and pass a URL instead.
+- uguu URLs expire after a few hours. The Teams message stays in the
+  channel but the image becomes a broken link the next day. If long-term
+  history matters, switch to an in-tenant store (SharePoint / OneDrive)
+  built into the Workflow.
 - A solid-color background (white sheet, etc.) behind the carafe dramatically
   improves Gemini's accuracy. Strong backlight (a window, curtain) washes out
   the coffee colour and triggers false "empty" readings.

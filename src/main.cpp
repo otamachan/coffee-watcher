@@ -43,6 +43,9 @@ static constexpr uint32_t kCheckIntervalMs = 5UL * 60 * 1000;  // 5 min
 static constexpr uint32_t kFirstCheckDelayMs = 10000;          // 10s after boot
 static constexpr float    kMinConfidence = 0.5f;
 static constexpr time_t   kStatusDelaySec = 30 * 60;            // Status notification 30 min after a new brew
+// BREWED notification fires only when cups_remaining reaches this threshold;
+// avoids posting during the drip phase when the carafe is still filling.
+static constexpr float    kBrewedMinCups  = 3.0f;
 
 // Active hours: weekdays 9:00 (inclusive) - 18:00 (exclusive) JST
 static constexpr int kActiveStartHour = 9;
@@ -244,26 +247,6 @@ static String htmlEscape(const String& in) {
   return out;
 }
 
-// JSON string escape: handles " and \ and control characters.
-static String jsonEscape(const String& in) {
-  String out;
-  out.reserve(in.length() + 8);
-  for (size_t i = 0; i < in.length(); ++i) {
-    const char c = in[i];
-    if (c == '"')       out += "\\\"";
-    else if (c == '\\') out += "\\\\";
-    else if (c == '\n') out += "\\n";
-    else if (c == '\r') out += "\\r";
-    else if (c == '\t') out += "\\t";
-    else if (static_cast<unsigned char>(c) < 0x20) {
-      char buf[8];
-      snprintf(buf, sizeof(buf), "\\u%04x", c);
-      out += buf;
-    } else out += c;
-  }
-  return out;
-}
-
 struct CoffeeEstimate {
   bool ok = false;
   float cups_remaining = 0.0f;
@@ -427,103 +410,155 @@ static CoffeeEstimate geminiAnalyze(const uint8_t* jpeg, size_t jpeg_len) {
   return r;
 }
 
-// Post a JPEG to the Teams Incoming Webhook inline as a base64 data URI.
-// The payload is allocated in PSRAM to avoid pressuring the internal heap.
-static bool teamsPost(const char* title, const char* text,
-                      const uint8_t* jpeg, size_t jpeg_len) {
-  // 1. Base64 encode
-  size_t b64_olen = 0;
-  mbedtls_base64_encode(nullptr, 0, &b64_olen, jpeg, jpeg_len);
-  uint8_t* b64 = static_cast<uint8_t*>(ps_malloc(b64_olen + 1));
-  if (!b64) {
-    Serial.println("[teams] ps_malloc b64 failed");
-    return false;
-  }
-  if (mbedtls_base64_encode(b64, b64_olen, &b64_olen, jpeg, jpeg_len) != 0) {
-    Serial.println("[teams] base64 encode failed");
-    free(b64);
-    return false;
-  }
-  b64[b64_olen] = 0;
+// Upload a JPEG to https://uguu.se via multipart/form-data and return the
+// resulting public URL. uguu hosts the file for a few hours, which is enough
+// for Teams to render it inline in the Adaptive Card. Returns "" on failure.
+// TLS uses setInsecure() since the image carries no secret and uguu's ZeroSSL
+// chain isn't in our cert.h.
+static String uguuUpload(const uint8_t* jpeg, size_t jpeg_len) {
+  static const char* kBoundary = "----coffee-watcher-7f4d2c1a";
 
-  // 2. Build the JSON payload (MessageCard)
-  const size_t payload_cap = b64_olen + 1024;
-  char* payload = static_cast<char*>(ps_malloc(payload_cap));
-  if (!payload) {
-    Serial.println("[teams] ps_malloc payload failed");
-    free(b64);
-    return false;
-  }
-  const String esc_title = jsonEscape(title);
-  const String esc_text  = jsonEscape(text);
-  const int n = snprintf(payload, payload_cap,
-    "{\"@type\":\"MessageCard\","
-     "\"@context\":\"http://schema.org/extensions\","
-     "\"summary\":\"coffee-watcher\","
-     "\"themeColor\":\"0078D4\","
-     "\"title\":\"%s\","
-     "\"text\":\"%s\","
-     "\"sections\":[{\"images\":[{\"image\":\"data:image/jpeg;base64,%s\"}]}]"
-    "}",
-    esc_title.c_str(), esc_text.c_str(), reinterpret_cast<char*>(b64));
-  free(b64);
-  if (n < 0 || static_cast<size_t>(n) >= payload_cap) {
-    Serial.printf("[teams] payload truncated (n=%d cap=%u)\n", n, (unsigned)payload_cap);
-    free(payload);
-    return false;
-  }
-  Serial.printf("[teams] payload=%d B (jpeg=%u B)\n", n, (unsigned)jpeg_len);
+  String head;
+  head.reserve(180);
+  head  = "--";
+  head += kBoundary;
+  head += "\r\nContent-Disposition: form-data; name=\"files[]\"; filename=\"thumb.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
 
-  // 3. HTTPS POST
+  String tail;
+  tail.reserve(48);
+  tail  = "\r\n--";
+  tail += kBoundary;
+  tail += "--\r\n";
+
+  const size_t body_len = head.length() + jpeg_len + tail.length();
+  uint8_t* body = static_cast<uint8_t*>(ps_malloc(body_len));
+  if (!body) {
+    Serial.println("[uguu] ps_malloc body failed");
+    return String();
+  }
+  size_t pos = 0;
+  memcpy(body + pos, head.c_str(), head.length()); pos += head.length();
+  memcpy(body + pos, jpeg,         jpeg_len);      pos += jpeg_len;
+  memcpy(body + pos, tail.c_str(), tail.length()); pos += tail.length();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+
+  HTTPClient http;
+  http.setTimeout(20000);
+  if (!http.begin(client, "https://uguu.se/upload")) {
+    Serial.println("[uguu] http.begin failed");
+    free(body);
+    return String();
+  }
+  http.addHeader("Content-Type", String("multipart/form-data; boundary=") + kBoundary);
+
+  const uint32_t t0 = millis();
+  const int code = http.POST(body, body_len);
+  const uint32_t dt = millis() - t0;
+  const String resp = http.getString();
+  http.end();
+  free(body);
+
+  Serial.printf("[uguu] HTTP %d  %u ms  body=%u B\n", code, dt, resp.length());
+  if (code < 200 || code >= 300) {
+    logEvent("UGUU", String("HTTP ") + code, true);
+    return String();
+  }
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    logEvent("UGUU", String("json parse: ") + err.c_str(), true);
+    return String();
+  }
+  if (!doc["success"].as<bool>()) {
+    logEvent("UGUU", "success=false", true);
+    return String();
+  }
+  String url = doc["files"][0]["url"].as<String>();
+  if (url.length() == 0) {
+    logEvent("UGUU", "url missing in response", true);
+    return String();
+  }
+  Serial.printf("[uguu] url=%s\n", url.c_str());
+  return url;
+}
+
+// Post an Adaptive Card to a Power Automate (Teams Workflow) HTTP trigger.
+// image_url may be empty, in which case the card is text-only. The flow on
+// the other side hands the card to "Post card in a chat or channel" verbatim,
+// so the request body IS the Adaptive Card JSON.
+//
+// Power Automate returns HTTP 202 on successful trigger; the actual Teams
+// post happens asynchronously and failures only surface in the flow's run
+// history. The 202 acceptance is the strongest signal we can check here.
+static bool teamsPost(const char* title, const char* text, const String& image_url) {
+  JsonDocument card;
+  card["type"]    = "AdaptiveCard";
+  card["$schema"] = "http://adaptivecards.io/schemas/adaptive-card.json";
+  card["version"] = "1.4";
+  JsonArray body = card["body"].to<JsonArray>();
+  {
+    JsonObject t = body.add<JsonObject>();
+    t["type"]   = "TextBlock";
+    t["text"]   = title;
+    t["weight"] = "Bolder";
+    t["size"]   = "Medium";
+    t["wrap"]   = true;
+  }
+  if (text && text[0]) {
+    JsonObject t = body.add<JsonObject>();
+    t["type"] = "TextBlock";
+    t["text"] = text;
+    t["wrap"] = true;
+  }
+  if (image_url.length() > 0) {
+    JsonObject img = body.add<JsonObject>();
+    img["type"]    = "Image";
+    img["url"]     = image_url;
+    img["size"]    = "Large";
+    img["altText"] = "coffee-watcher";
+  }
+
+  String payload;
+  serializeJson(card, payload);
+
   WiFiClientSecure client;
   client.setCACert(DIGICERT_GLOBAL_ROOT_G2);
   client.setHandshakeTimeout(15);
 
   HTTPClient http;
-  http.setTimeout(15000);
+  http.setTimeout(20000);
   if (!http.begin(client, teamsUrl())) {
     Serial.println("[teams] http.begin failed");
-    free(payload);
     return false;
   }
   http.addHeader("Content-Type", "application/json; charset=utf-8");
 
   const uint32_t t0 = millis();
-  const int code = http.POST(reinterpret_cast<uint8_t*>(payload), n);
+  const int code = http.POST(payload);
   const uint32_t dt = millis() - t0;
   const String resp = http.getString();
   http.end();
-  free(payload);
 
-  // Dump the raw body as text and hex to make root-cause analysis easier (detects whitespace/newlines).
-  Serial.printf("[teams] HTTP %d  %u ms  resp_len=%u\n", code, dt, resp.length());
-  Serial.print("[teams] resp(text): ");
-  Serial.println(resp.substring(0, 200));
-  Serial.print("[teams] resp(hex):  ");
-  for (size_t i = 0; i < resp.length() && i < 32; ++i) {
-    Serial.printf("%02X ", static_cast<unsigned char>(resp[i]));
-  }
-  Serial.println();
+  Serial.printf("[teams] HTTP %d  %u ms  payload=%u B  resp=%u B\n",
+                code, dt, payload.length(), resp.length());
 
-  // Incoming Webhook returns body "1" on successful delivery. Trim before
-  // comparing in case Microsoft surrounds it with whitespace or newlines.
-  String trimmed = resp;
-  trimmed.trim();
-  const bool delivered = (code >= 200 && code < 300) && (trimmed == "1");
-  if (!delivered && code >= 200 && code < 300) {
-    Serial.println("[teams] HTTP 2xx but body != '1' -> delivery FAILED on Teams side");
-  }
-
-  if (delivered) {
-    logEvent("TEAMS", String("posted to ") + g_channel + " (\"" + title + "\")", false);
+  const bool accepted = (code >= 200 && code < 300);
+  if (accepted) {
+    String extra = (image_url.length() > 0) ? String(" w/img") : String(" text-only");
+    logEvent("TEAMS", String("posted to ") + g_channel + " (\"" + title + "\")" + extra, false);
   } else {
-    String snippet = trimmed;
+    String snippet = resp;
     if (snippet.length() > 120) snippet = snippet.substring(0, 117) + "...";
-    char msg[200];
+    char msg[220];
     snprintf(msg, sizeof(msg), "HTTP %d body=%s", code, snippet.c_str());
     logEvent("TEAMS", msg, true);
   }
-  return delivered;
+  return accepted;
 }
 
 // Returns true if it's a weekday (Mon-Fri) and 9:00-18:00 JST. False if NTP is not yet synced.
@@ -608,8 +643,10 @@ static void runCheck(bool force = false) {
   // Capture is assumed to be VGA
   const uint16_t img_w = 640, img_h = 480;
 
-  if (was_empty && !now_empty) {
-    // (1) New brew detected: empty -> non-empty
+  if (was_empty && !now_empty && est.cups_remaining >= kBrewedMinCups) {
+    // (1) New brew detected: empty -> non-empty AND cups crossed the threshold.
+    // Below the threshold we leave g_last_state unchanged so subsequent cycles
+    // keep re-evaluating until the carafe is full enough to be worth a ping.
     const String text = String("約 ") + cups_str + " 杯  — " + est.reason;
     if (teamsPostThumb("☕ 新しくコーヒーがはいりました！", text.c_str(),
                        jpeg, jpeg_len, img_w, img_h)) {
@@ -660,7 +697,8 @@ static void runCheck(bool force = false) {
 }
 
 // Produce a smaller JPEG by decoding, scaling 1/2, and re-encoding.
-// Workaround for Microsoft's Teams Webhook rejecting large image payloads.
+// Keeps the uguu upload (and therefore the URL hand-off to Teams) tiny so the
+// flow stays within Power Automate's request size budget.
 // Returns nullptr on failure. Caller must free() the returned buffer.
 static uint8_t* jpegMakeThumb(const uint8_t* src, size_t src_len,
                               uint16_t src_w, uint16_t src_h,
@@ -699,20 +737,25 @@ static uint8_t* jpegMakeThumb(const uint8_t* src, size_t src_len,
   return out;
 }
 
-// Post to Teams using a downscaled thumbnail of the given JPEG.
-// Falls back to the original on resize failure (Teams may still reject it).
+// Post to Teams via Power Automate. Downscales the JPEG to keep the uguu
+// upload small, uploads to uguu to obtain a public URL, then posts an
+// Adaptive Card referencing that URL. If the upload fails, still posts a
+// text-only card so the notification isn't silently dropped.
 static bool teamsPostThumb(const char* title, const char* text,
                            const uint8_t* jpeg, size_t jpeg_len,
                            uint16_t src_w, uint16_t src_h) {
   size_t thumb_len = 0;
   uint8_t* thumb = jpegMakeThumb(jpeg, jpeg_len, src_w, src_h, 25, &thumb_len);
-  if (!thumb) {
-    Serial.println("[teams] thumb failed, falling back to original");
-    return teamsPost(title, text, jpeg, jpeg_len);
+  const uint8_t* upload_buf = thumb ? thumb : jpeg;
+  const size_t   upload_len = thumb ? thumb_len : jpeg_len;
+  if (!thumb) Serial.println("[teams] thumb failed, uploading original");
+
+  String image_url = uguuUpload(upload_buf, upload_len);
+  if (thumb) free(thumb);
+  if (image_url.length() == 0) {
+    Serial.println("[teams] uguu upload failed, posting text-only card");
   }
-  const bool ok = teamsPost(title, text, thumb, thumb_len);
-  free(thumb);
-  return ok;
+  return teamsPost(title, text, image_url);
 }
 
 static void handleJpg() {
